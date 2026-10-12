@@ -1,4 +1,4 @@
-// Minimal Jev client: TypeSafe System One directly, or through OpenRouter's decisions endpoint.
+// Minimal Jev client: TypeSafe System One. The incident agent does not use this key.
 export type ChoiceAnswer = {
   type: "choice";
   choice: string;
@@ -24,23 +24,15 @@ export type JevResult = {
 const RETRY = new Set([429, 502, 503, 529]);
 
 export class Jev {
-  readonly provider: "typesafe" | "openrouter";
-  private readonly endpoint: string;
+  readonly provider = "typesafe" as const;
+  private readonly endpoint = "https://api.typesafe.ai/v1/systemone";
   private readonly key: string;
-  private readonly model: string;
+  private readonly model = "jev-latest";
 
   constructor() {
-    if (process.env.TYPESAFE_API_KEY) {
-      this.provider = "typesafe";
-      this.endpoint = "https://api.typesafe.ai/v1/systemone";
-      this.key = process.env.TYPESAFE_API_KEY;
-      this.model = "jev-latest";
-    } else if (process.env.OPENROUTER_API_KEY) {
-      this.provider = "openrouter";
-      this.endpoint = "https://openrouter.ai/api/alpha/decisions";
-      this.key = process.env.OPENROUTER_API_KEY;
-      this.model = "~typesafe/jev-latest";
-    } else throw Error("Jev needs TYPESAFE_API_KEY or OPENROUTER_API_KEY");
+    const key = process.env.TYPESAFE_API_KEY;
+    if (!key) throw Error("Jev needs TYPESAFE_API_KEY");
+    this.key = key;
   }
 
   async ask(state: unknown, questions: Record<string, Question>): Promise<JevResult> {

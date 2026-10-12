@@ -4,7 +4,11 @@ import { EventEmitter } from "node:events";
 import { join } from "node:path";
 import { BACKGROUND_CONTEXT as ctx } from "@earendil-works/chord/context";
 import { createModels } from "@earendil-works/pi-ai/models";
-import { openrouterProvider } from "@earendil-works/pi-ai/providers/openrouter";
+import { openaiCodexProvider } from "@earendil-works/pi-ai/providers/openai-codex";
+import { xaiProvider } from "@earendil-works/pi-ai/providers/xai";
+import { zaiCodingCnProvider } from "@earendil-works/pi-ai/providers/zai-coding-cn";
+import { deepseekProvider } from "@earendil-works/pi-ai/providers/deepseek";
+import { PiAuthStore } from "../../../../dpi-backend/src/pi-auth-store.ts";
 import {
   Harness,
   configure,
@@ -29,6 +33,34 @@ import type { WatchStore } from "./watch-store.ts";
 import type { Trigger } from "./watcher.ts";
 
 const THINKING = ["off", "minimal", "low", "medium", "high", "xhigh"];
+const NATIVE = [openaiCodexProvider, xaiProvider, zaiCodingCnProvider, deepseekProvider];
+
+async function credentialedProviders(credentials: PiAuthStore) {
+  const stored = new Map((await credentials.list()).map((c) => [c.providerId, c.type]));
+  const enabled = new Set<string>();
+  for (const provider of ["openai-codex", "xai"]) if (stored.get(provider) === "oauth") enabled.add(provider);
+  for (const [provider, envName] of [
+    ["zai-coding-cn", "ZAI_CODING_CN_API_KEY"],
+    ["deepseek", "DEEPSEEK_API_KEY"],
+  ] as const) {
+    const credential = stored.get(provider) === "api_key" ? await credentials.read(provider) : undefined;
+    if ((credential?.type === "api_key" && credential.key) || process.env[envName]) enabled.add(provider);
+  }
+  return enabled;
+}
+
+function installNative(credentials: PiAuthStore) {
+  const models = createModels({ credentials });
+  for (const factory of NATIVE) {
+    const provider = factory();
+    const allowed = new Set<string>(curatedModels.filter((c) => c.provider === provider.id).map((c) => c.id));
+    models.setProvider({
+      ...provider,
+      getModels: () => provider.getModels().filter((m) => allowed.has(m.id)),
+    });
+  }
+  return models;
+}
 
 export class Ops extends EventEmitter {
   private openFingerprints = new Set<string>();
@@ -41,21 +73,17 @@ export class Ops extends EventEmitter {
     private readonly store: WatchStore,
     private readonly voice: Voice,
     private readonly unlock: () => void,
+    private readonly enabled: Set<string>,
   ) {
     super();
   }
 
   static async open(store: WatchStore, voice: Voice) {
-    const models = createModels();
-    const provider = openrouterProvider();
-    const catalog = provider.getModels();
-    if (!catalog.some((m) => m.id === config.model))
-      throw Error(`OpenRouter has no model ${config.model}`);
-    models.setProvider({
-      ...provider,
-      getModels: () =>
-        catalog.filter((m) => m.id === config.model || curatedModels.some((c) => c.id === m.id)),
-    });
+    const credentials = new PiAuthStore();
+    const models = installNative(credentials);
+    const enabled = await credentialedProviders(credentials);
+    if (!enabled.has(config.provider) || !models.getModel(config.provider, config.model))
+      throw Error(`No pi credential for ${config.provider}/${config.model}`);
     let ops: Ops | undefined;
     const extensions = createExtensions({
       store,
@@ -92,13 +120,13 @@ export class Ops extends EventEmitter {
       );
       const root = await harness.root(ctx, {
         agent: {
-          model: { provider: "openrouter", modelId: config.model },
+          model: { provider: config.provider, modelId: config.model },
           thinkingLevel: config.thinking,
           extensions: [extensions.OpsTools, extensions.Desk],
           cwd: repoDir,
         },
       });
-      ops = new Ops(harness, root, models, extensions, store, voice, unlock);
+      ops = new Ops(harness, root, models, extensions, store, voice, unlock, enabled);
       harness.resume();
       await ops.recover();
       return ops;
@@ -140,7 +168,7 @@ export class Ops extends EventEmitter {
       const branch = `incident/${slug}`;
       const conversation = await tx.createConversation({ ownership: { kind: "ownerless" } });
       await configure(tx, conversation.id, {
-        model: { provider: "openrouter", modelId: config.model },
+        model: { provider: config.provider, modelId: config.model },
         thinkingLevel: config.thinking,
         extensions: [CodingTools, this.extensions.OpsTools, this.extensions.IncidentAgent],
         cwd: worktree,
@@ -247,9 +275,9 @@ Your worktree ${incident.worktree} is checkout-api on branch ${incident.branch},
 
   modelList() {
     return curatedModels.flatMap((c) => {
-      const m = this.models.getModel("openrouter", c.id);
+      const m = this.enabled.has(c.provider) ? this.models.getModel(c.provider, c.id) : undefined;
       return m
-        ? [{ id: m.id, provider: "openrouter", name: c.name, tier: c.tier, icon: c.icon, contextWindow: m.contextWindow }]
+        ? [{ id: m.id, provider: c.provider, name: c.name, tier: c.tier, icon: c.icon, contextWindow: m.contextWindow }]
         : [];
     });
   }
@@ -284,7 +312,7 @@ Your worktree ${incident.worktree} is checkout-api on branch ${incident.branch},
         };
       case "configure": {
         const model = body.model as ModelRef | undefined;
-        if (model && (model.provider !== "openrouter" || !this.models.getModel("openrouter", model.modelId)))
+        if (model && !this.modelList().some((m) => m.provider === model.provider && m.id === model.modelId))
           throw Error("Choose a model from the list");
         if (body.thinkingLevel !== undefined && !THINKING.includes(String(body.thinkingLevel)))
           throw Error("Invalid thinking level");

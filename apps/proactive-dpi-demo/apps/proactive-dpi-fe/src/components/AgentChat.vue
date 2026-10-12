@@ -492,7 +492,7 @@ onBeforeUnmount(() => events?.close());
             <img :src="icon(m.id)" alt="" />
             <div>
               <strong>{{ m.name }}</strong
-              ><small>{{ m.tier }} / OpenRouter / {{ number(m.contextWindow) }} context</small>
+              ><small>{{ m.tier }} / {{ m.provider }} / {{ number(m.contextWindow) }} context</small>
             </div>
             <Check v-if="m.id === agent?.model?.modelId" :size="18" />
           </button>

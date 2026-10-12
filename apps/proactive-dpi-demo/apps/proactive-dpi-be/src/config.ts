@@ -1,7 +1,9 @@
 import { existsSync } from "node:fs";
 import { projectEnvPath } from "../../../shared/paths.ts";
+import { curatedModels, preferredModel } from "./model-catalog.ts";
 
-// OPENROUTER_API_KEY and ELEVENLABS_API_KEY live in the project root .env.
+// TYPESAFE_API_KEY and ELEVENLABS_API_KEY live in the project root .env.
+// Agent logins stay in pi's auth.json. This process does not read an OpenRouter key.
 if (existsSync(projectEnvPath)) process.loadEnvFile(projectEnvPath);
 
 const args = process.argv.slice(2);
@@ -13,6 +15,16 @@ const option = (key: string, fallback: string) => {
 };
 // Host playback uses afplay, which only macOS has. Elsewhere the voice plays in the browser.
 const tts = option("--tts", process.platform === "darwin" ? "host" : "browser");
+function resolveModel(raw: string) {
+  const slash = raw.indexOf("/");
+  const provider = slash < 0 ? undefined : raw.slice(0, slash);
+  const modelId = slash < 0 ? raw : raw.slice(slash + 1);
+  const match = curatedModels.find((m) => m.id === modelId && (provider === undefined || m.provider === provider));
+  if (!match)
+    throw Error(`Unknown model ${raw}. Choose one of: ${curatedModels.map((m) => `${m.provider}/${m.id}`).join(", ")}`);
+  return { provider: match.provider, model: match.id };
+}
+
 if (!["host", "browser", "both", "off"].includes(tts)) throw Error("--tts is host, browser, both, or off");
 
 export const config = {
@@ -20,7 +32,7 @@ export const config = {
   /** Loopback by default: the UI has no login and the incident agent runs bash. Pass --host 0.0.0.0 for a LAN. */
   host: option("--host", "127.0.0.1"),
   dev: args.includes("--dev"),
-  model: option("--model", "anthropic/claude-sonnet-5.5"),
+  ...resolveModel(option("--model", `${preferredModel.provider}/${preferredModel.modelId}`)),
   thinking: option("--thinking", "high") as "off" | "minimal" | "low" | "medium" | "high" | "xhigh",
   /** Incident verdicts sharing one fingerprint inside the window that open an incident. */
   incidentThreshold: Number(option("--incident-threshold", "3")),

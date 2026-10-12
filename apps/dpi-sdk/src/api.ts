@@ -62,6 +62,8 @@ export interface DeviceInfo {
   platform: string;
   apiVersion: typeof API_VERSION;
   durableVersion: string;
+  /** Git SHA of the backend checkout, or VERSION stamped when its files were copied. */
+  buildRevision: string;
   startedAt: number;
   /** Where new sessions start: the directory browser opens here, relative cwds resolve against the first. */
   startDirs: string[];

@@ -97,6 +97,9 @@ async function deploy(device: NetDevice, ctx: DriverContext) {
     `mkdir -p "${shPath(device.codeDir)}/apps" "${shPath(device.codeDir)}/e2e" "${shPath(device.homeDir)}" && chmod 700 "${shPath(device.homeDir)}"`,
   );
   await rsync(device, ["apps/dpi-backend", "apps/dpi-sdk"], `${code}/apps/`, ctx.config.root);
+  const revision = (await run("git", ["rev-parse", "--short=12", "HEAD"], { cwd: ctx.config.root, timeoutMs: 5000 })).stdout.trim();
+  if (!/^[0-9a-f]{7,40}$/.test(revision)) throw Error(`deploy ${device.id}: invalid source revision`);
+  await exec(device, `printf '%s\\n' ${q(revision)} > "${shPath(device.codeDir)}/VERSION"`);
   ctx.log(`deploy ${device.id}: npm ci`);
   await exec(
     device,

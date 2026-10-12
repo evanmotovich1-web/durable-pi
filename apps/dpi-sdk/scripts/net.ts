@@ -28,7 +28,7 @@ async function probe(url: string, token: string | null) {
   try {
     const info = await new DpiClient(url, token).device({ timeoutMs: 5000 });
     const tree = await new DpiClient(url, token).tree();
-    return { status: "online", detail: `${info.name} uid ${info.uid.slice(0, 8)} api v${info.apiVersion} ${tree.sessions.length} sessions` };
+    return { status: "online", detail: `${info.name} uid ${info.uid.slice(0, 8)} api v${info.apiVersion} build ${info.buildRevision ?? "unknown"} ${tree.sessions.length} sessions` };
   } catch (e) {
     const err = e as DpiError;
     return { status: err.code === "unauthorized" ? "unauthorized" : "offline", detail: err.message };

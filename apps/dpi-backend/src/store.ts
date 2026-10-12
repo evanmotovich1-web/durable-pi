@@ -66,6 +66,7 @@ import { createPlayground, Workspace, type SpawnSession } from "./extensions.js"
 import { createJobs, JobRuns, JOB_DEFS, jobDef, resolveJobInput, type Jobs } from "./jobs.js";
 import { ADDON_INFO, createAddons, PROMPTS, PromptChecklist, type Addons } from "./addons.js";
 import { JOB_RUNS_DOC } from "../../dpi-sdk/src/jobs.js";
+import { readBuildRevision } from "./build-revision.js";
 
 export const DURABLE_VERSION = "1.0.3";
 
@@ -102,6 +103,7 @@ export interface StoreOptions {
 /** Agent documents a client may read or stream, by kind. */
 /** apps/dpi-backend/src → the checkout root. */
 const CODE_DIR = resolve(import.meta.dirname, "../../..");
+const BUILD_REVISION = readBuildRevision(CODE_DIR);
 const AGENT_DOCS = { [JOB_RUNS_DOC]: JobRuns, "demo.workspace": Workspace } as const;
 export const AGENT_DOC_KINDS = Object.keys(AGENT_DOCS);
 export const DEVICE_DOC_KINDS = ["app.shared-state"];
@@ -255,6 +257,7 @@ export class Store {
       platform: `${platform()}-${process.arch} node ${process.version}`,
       apiVersion: 1,
       durableVersion: DURABLE_VERSION,
+      buildRevision: BUILD_REVISION,
       startedAt: this.startedAt,
       startDirs: this.startDirs,
       models: this.modelList,

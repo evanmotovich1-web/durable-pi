@@ -38,8 +38,13 @@ import { homedir, hostname, platform } from "node:os";
 import { randomUUID } from "node:crypto";
 import { BACKGROUND_CONTEXT as ctx, withAbortSignal } from "@earendil-works/chord/context";
 import { createModels } from "@earendil-works/pi-ai/models";
-import { openrouterProvider } from "@earendil-works/pi-ai/providers/openrouter";
-import { curatedModels, defaultModelId } from "./model-catalog.js";
+import type { CredentialStore } from "@earendil-works/pi-ai";
+import { openaiCodexProvider } from "@earendil-works/pi-ai/providers/openai-codex";
+import { xaiProvider } from "@earendil-works/pi-ai/providers/xai";
+import { zaiCodingCnProvider } from "@earendil-works/pi-ai/providers/zai-coding-cn";
+import { deepseekProvider } from "@earendil-works/pi-ai/providers/deepseek";
+import { curatedModels, preferredModel } from "./model-catalog.js";
+import { PiAuthStore } from "./pi-auth-store.js";
 import { fauxModels, installFaux } from "./faux.js";
 import {
   Harness,
@@ -90,7 +95,8 @@ export interface StoreOptions {
   dataDir: string;
   startDirs: string[];
   name: string;
-  provider: "openrouter" | "faux";
+  provider: "native" | "faux";
+  credentials?: CredentialStore;
 }
 
 /** Agent documents a client may read or stream, by kind. */
@@ -141,7 +147,8 @@ const decodeCursor = (cursor?: string) => {
 };
 
 export class Store {
-  readonly models = createModels();
+  readonly models: ReturnType<typeof createModels>;
+  readonly credentials?: CredentialStore;
   readonly opened = new Map<string, Opened>();
   readonly errors = new Map<string, string>();
   readonly catalog: DatabaseSync;
@@ -177,17 +184,13 @@ export class Store {
   }
 
   private constructor(readonly options: StoreOptions) {
-    if (options.provider === "faux") installFaux(this.models);
-    else {
-      const provider = openrouterProvider();
-      const catalog = provider.getModels();
-      for (const model of curatedModels)
-        if (!catalog.some((m) => m.id === model.id)) throw Error(`OpenRouter catalog missing ${model.id}`);
-      this.models.setProvider({
-        ...provider,
-        getModels: () => catalog.filter((m) => curatedModels.some((c) => c.id === m.id)),
-      });
-    }
+    this.credentials = options.provider === "native" ? (options.credentials ?? new PiAuthStore()) : undefined;
+    this.models = createModels({ credentials: this.credentials });
+    // Old faux sessions must still open when a device switches to native providers.
+    installFaux(this.models);
+    if (options.provider === "native")
+      for (const provider of [openaiCodexProvider(), xaiProvider(), zaiCodingCnProvider(), deepseekProvider()])
+        this.models.setProvider(provider);
     mkdirSync(options.dataDir, { recursive: true, mode: 0o700 });
     this.unlockCatalog = lockFile(`${this.catalogPath}.lock`);
     this.catalog = new DatabaseSync(this.catalogPath);
@@ -214,6 +217,7 @@ export class Store {
       store.unlockShared = lockFile(`${store.sharedStatePath}.lock`);
       store.shared = await SharedState.open(store.sharedStatePath);
       store.shared.harness.subscribeCommits(() => store.notify());
+      store.modelList = await store.loadModels();
       for (const row of store.list()) {
         try {
           await store.openAgent(row);
@@ -223,7 +227,6 @@ export class Store {
       }
       if (!(await store.shared.initialized()))
         await store.shared.initialize({ goal: "Explore durable agents", counter: 0, notes: [] });
-      store.modelList = await store.loadModels();
       for (const { harness } of store.opened.values()) harness.resume();
       return store;
     } catch (e) {
@@ -264,7 +267,9 @@ export class Store {
   }
 
   private defaultModel() {
-    return this.options.provider === "faux" ? fauxModels[0].id : defaultModelId;
+    if (this.options.provider === "faux") return fauxModels[0].id;
+    return (this.modelList.find((m) => m.provider === preferredModel.provider && m.id === preferredModel.modelId)
+      ?? this.modelList[0])?.id ?? "";
   }
 
   private async loadModels(): Promise<ModelInfo[]> {
@@ -279,14 +284,22 @@ export class Store {
         reasoning: false,
         cost: { input: 0, output: 0 },
       }));
-    const available = await this.models.getAvailable("openrouter", { signal: AbortSignal.timeout(10000) });
+    const credentials = this.credentials!;
+    const stored = new Map((await credentials.list()).map((c) => [c.providerId, c.type]));
+    const enabled = new Set<string>();
+    for (const provider of ["openai-codex", "xai"])
+      if (stored.get(provider) === "oauth") enabled.add(provider);
+    for (const [provider, envName] of [["zai-coding-cn", "ZAI_CODING_CN_API_KEY"], ["deepseek", "DEEPSEEK_API_KEY"]]) {
+      const credential = stored.get(provider) === "api_key" ? await credentials.read(provider) : undefined;
+      if ((credential?.type === "api_key" && credential.key) || process.env[envName]) enabled.add(provider);
+    }
     return curatedModels.flatMap((c) => {
-      const m = available.find((m) => m.id === c.id);
+      const m = enabled.has(c.provider) ? this.models.getModel(c.provider, c.id) : undefined;
       return m
         ? [
             {
               id: m.id,
-              provider: "openrouter",
+              provider: c.provider,
               name: c.name,
               tier: c.tier,
               icon: c.icon,
@@ -304,11 +317,12 @@ export class Store {
       const id = fauxModels.some((m) => m.id === model?.modelId) ? model!.modelId : fauxModels[0].id;
       return { provider: "faux", modelId: id };
     }
-    const exact = model?.provider === "openrouter" ? model.modelId : `${model?.provider}/${model?.modelId}`;
-    return {
-      provider: "openrouter",
-      modelId: curatedModels.some((m) => m.id === exact) ? exact : defaultModelId,
-    };
+    if (model?.provider === "faux" && fauxModels.some((m) => m.id === model.modelId)) return model;
+    if (model && this.modelList.some((m) => m.provider === model.provider && m.id === model.modelId)) return model;
+    const fallback = this.modelList.find((m) => m.provider === preferredModel.provider && m.id === preferredModel.modelId)
+      ?? this.modelList[0];
+    if (!fallback) throw Error("No native model credential is configured on this device");
+    return { provider: fallback.provider, modelId: fallback.id };
   }
 
   validateModel(model: unknown): ModelRef {
@@ -318,8 +332,7 @@ export class Store {
     const known =
       this.options.provider === "faux"
         ? m.provider === "faux" && fauxModels.some((f) => f.id === m.modelId)
-        : m.provider === "openrouter" &&
-          curatedModels.some((c) => c.id === m.modelId) &&
+        : this.modelList.some((listed) => listed.provider === m.provider && listed.id === m.modelId) &&
           !!this.models.getModel(m.provider, m.modelId);
     if (!known) throw invalid(`Unknown model ${m.provider}/${m.modelId}. Choose one from GET /v1/device models`);
     return { provider: m.provider, modelId: m.modelId };

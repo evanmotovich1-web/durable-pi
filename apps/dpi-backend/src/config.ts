@@ -13,7 +13,7 @@ export interface BackendConfig {
   envFile: string;
   dataDir: string;
   startDirs: string[];
-  provider: "openrouter" | "faux";
+  provider: "native" | "faux";
   token: string;
 }
 
@@ -41,11 +41,13 @@ export function loadConfig(argv = process.argv.slice(2), env = process.env): Bac
       .split(":")
       .filter(Boolean)
       .map((p) => resolve(expand(p))),
-    provider: (env.DPI_PROVIDER ?? "openrouter") === "faux" ? "faux" : "openrouter",
+    provider: (env.DPI_PROVIDER ?? "native") as "native" | "faux",
     token: env.DPI_TOKEN ?? "",
   };
   if (!Number.isInteger(config.port) || config.port < 1 || config.port > 65535)
     throw Error(`Invalid port: ${config.port}`);
+  if (config.provider !== "native" && config.provider !== "faux")
+    throw Error(`Invalid DPI_PROVIDER: ${config.provider}`);
   if (config.token.length < 32)
     throw Error(
       `DPI_TOKEN is missing or shorter than 32 characters (looked in ${envFile}). Create one with: npm run token`,

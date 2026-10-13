@@ -1,0 +1,61 @@
+{
+  "effort_words": ["off", "low", "medium", "high", "max"],
+  "verified_from": {
+    "claude": {
+      "command": "claude --help",
+      "flag": "--effort",
+      "help_excerpt": "--effort <level> Effort level for the current session (low, medium, high, xhigh, max)",
+      "accepted_values": ["low", "medium", "high", "xhigh", "max"],
+      "accepts_off": false
+    },
+    "pi": {
+      "command": "pi --help",
+      "flag": "--thinking",
+      "help_excerpt": "--thinking <level> Set thinking level: off, minimal, low, medium, high, xhigh, max",
+      "accepted_values": ["off", "minimal", "low", "medium", "high", "xhigh", "max"]
+    }
+  },
+  "unmapped_verified_values": {
+    "note": "Both CLIs accept xhigh. Pi also accepts minimal. Those values are not effort words in this map.",
+    "claude_effort": ["xhigh"],
+    "pi_thinking": ["minimal", "xhigh"]
+  },
+  "map": {
+    "off": {
+      "pi_thinking": "off",
+      "pi_flag": "--thinking",
+      "claude_effort": null,
+      "claude_flag": "--effort",
+      "claude_omit_flag": true,
+      "note": "claude --help does not accept off for --effort. Do not pass --effort off."
+    },
+    "low": {
+      "pi_thinking": "low",
+      "pi_flag": "--thinking",
+      "claude_effort": "low",
+      "claude_flag": "--effort",
+      "claude_omit_flag": false
+    },
+    "medium": {
+      "pi_thinking": "medium",
+      "pi_flag": "--thinking",
+      "claude_effort": "medium",
+      "claude_flag": "--effort",
+      "claude_omit_flag": false
+    },
+    "high": {
+      "pi_thinking": "high",
+      "pi_flag": "--thinking",
+      "claude_effort": "high",
+      "claude_flag": "--effort",
+      "claude_omit_flag": false
+    },
+    "max": {
+      "pi_thinking": "max",
+      "pi_flag": "--thinking",
+      "claude_effort": "max",
+      "claude_flag": "--effort",
+      "claude_omit_flag": false
+    }
+  }
+}

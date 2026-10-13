@@ -72,7 +72,12 @@ export interface DeviceInfo {
   storage: { dataDir: string; catalogPath: string; appStatePath: string };
   /** The checkout the backend runs from (repo root locally, `code_dir` on deployed devices). */
   codeDir?: string;
-  capabilities: Array<"events" | "docs" | "demo" | "jobs">;
+  capabilities: {
+    features: Array<"events" | "docs" | "demo" | "jobs">;
+    thinkingLevels: ThinkingLevel[];
+    harnesses: Array<"pi" | "claude-code">;
+    prompts: string[];
+  };
   /** Durable jobs any agent on this device can run (`POST .../demo/jobs` or the run_durable_job tool). */
   jobs?: JobDef[];
 }

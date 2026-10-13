@@ -16,7 +16,7 @@ The contract every Durable Agent Network client uses: the web hub, `dpi-tui`, sc
 | Route | Body / query | Returns |
 |---|---|---|
 | `GET /healthz` | (no auth) | `{ok:true}` |
-| `GET /v1/device` | | `DeviceInfo`: uid, name, hostname, platform, `apiVersion`, `durableVersion`, `startedAt`, models, `defaultModel`, `startDirs`, storage, `codeDir` (the checkout it runs from), capabilities, `jobs` (durable job definitions) |
+| `GET /v1/device` | | `DeviceInfo`: uid, name, hostname, platform, `apiVersion`, `durableVersion`, `startedAt`, models, `defaultModel`, `startDirs`, storage, `codeDir` (the checkout it runs from), capabilities (`features`, `thinkingLevels`, `harnesses`, `prompts`), `jobs` (durable job definitions) |
 | `GET /v1/tree` | | `DeviceTree`: sessions with agents and busy/background |
 | `GET /v1/events` | `?docs=app.shared-state` | device stream |
 | `GET /v1/fs/dirs` | `?path=` (empty = start dirs) | `{path, parent, dirs[]}`, one level, directories only |

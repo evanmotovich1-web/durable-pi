@@ -60,17 +60,18 @@ import {
   type ToolRegistration,
 } from "@earendil-works/pi-durable";
 import { CodingTools } from "@earendil-works/pi-durable/tools";
-import { NodeExecutionEnv } from "@earendil-works/pi-durable/env/node";
 import { openNodeSqliteStorage } from "@earendil-works/pi-durable/storage/sqlite/node";
+import { AgentExecutionEnv, agentShellEnv } from "./exec-env.js";
 import { createPlayground, Workspace, type SpawnSession } from "./extensions.js";
 import { createJobs, JobRuns, JOB_DEFS, jobDef, resolveJobInput, type Jobs } from "./jobs.js";
 import { ADDON_INFO, createAddons, PROMPTS, PromptChecklist, type Addons } from "./addons.js";
 import { JOB_RUNS_DOC } from "../../dpi-sdk/src/jobs.js";
 import { readBuildRevision } from "./build-revision.js";
+import { claudeCodeAvailable } from "./device-capabilities.js";
 
 export const DURABLE_VERSION = "1.0.3";
 
-/** Tools that create, update or delete: shell, files, App State, job runs, sessions, pages and subagents. */
+/** Tools that create, update or delete: shell, files, App State, job runs, sessions, pages, subagents, and the Claude Code CLI. */
 export const WRITE_TOOLS = new Set([
   "bash",
   "write",
@@ -80,6 +81,7 @@ export const WRITE_TOOLS = new Set([
   "ping_on_call_engineer",
   "subagent",
   "start_session",
+  "claude_code",
 ]);
 
 export type SessionRow = {
@@ -98,6 +100,8 @@ export interface StoreOptions {
   name: string;
   provider: "native" | "faux";
   credentials?: CredentialStore;
+  /** Override the startup login probe in tests; production runs `claude auth status`. */
+  claudeCodeProbe?: () => Promise<boolean>;
 }
 
 /** Agent documents a client may read or stream, by kind. */
@@ -158,6 +162,7 @@ export class Store {
   shared!: SharedState;
   uid!: string;
   modelList: ModelInfo[] = [];
+  private hasClaudeCode = false;
   private unlockCatalog: () => void;
   private unlockShared?: () => void;
   private listeners = new Set<() => void>();
@@ -220,6 +225,7 @@ export class Store {
       store.shared = await SharedState.open(store.sharedStatePath);
       store.shared.harness.subscribeCommits(() => store.notify());
       store.modelList = await store.loadModels();
+      store.hasClaudeCode = await (options.claudeCodeProbe ?? claudeCodeAvailable)().catch(() => false);
       for (const row of store.list()) {
         try {
           await store.openAgent(row);
@@ -264,7 +270,12 @@ export class Store {
       defaultModel: this.defaultModel(),
       storage: { dataDir: this.options.dataDir, catalogPath: this.catalogPath, appStatePath: this.sharedStatePath },
       codeDir: CODE_DIR,
-      capabilities: ["events", "docs", "demo", "jobs"],
+      capabilities: {
+        features: ["events", "docs", "demo", "jobs"],
+        thinkingLevels: [...THINKING_LEVELS],
+        harnesses: this.hasClaudeCode ? ["pi", "claude-code"] : ["pi"],
+        prompts: PROMPTS.map((prompt) => prompt.id),
+      },
       jobs: JOB_DEFS,
     };
   }
@@ -514,18 +525,14 @@ export class Store {
     await mkdir(dirname(row.dbPath), { recursive: true });
     const unlock = lockFile(`${row.dbPath}.lock`);
     try {
-      const shellEnv = Object.fromEntries(
-        ["PATH", "HOME", "USER", "SHELL", "TMPDIR", "LANG", "TERM"].flatMap((k) =>
-          process.env[k] ? [[k, process.env[k]]] : [],
-        ),
-      );
+      const shellEnv = agentShellEnv();
       const registry = createRegistry();
       registry.install(CodingTools);
       const jobs = createJobs({ shared: this.shared, sessionId: row.id });
       const compaction = () => this.compactionOf(row.id);
       const playground = createPlayground(this.shared, row.id, this.spawnSession, jobs);
       registry.install(playground);
-      // Custom extensions are installed but not selected: an agent turns them on in its own selection.
+      // Only system-prompts is selected for newly created agents. Existing agents retain their stored selection.
       const addons = createAddons({ offline: this.options.provider === "faux" });
       for (const extension of addons.list) registry.install(extension);
       const harness = await Harness.open(
@@ -533,7 +540,7 @@ export class Store {
         {
           models: this.models,
           registry,
-          env: ({ cwd }) => new NodeExecutionEnv({ cwd: cwd ?? row.cwd, shellEnv }),
+          env: ({ cwd }) => new AgentExecutionEnv({ cwd: cwd ?? row.cwd, allowed: shellEnv }),
           conversationCreated: async (tx, c) => {
             await tx.doc(Workspace, c.id);
             await tx.doc(JobRuns, c.id);
@@ -555,6 +562,7 @@ export class Store {
           cwd: row.cwd,
           model: { provider: row.provider, modelId: row.model },
           thinkingLevel,
+          ...(create ? { extensions: { add: [addons.all["system-prompts"]] } } : {}),
         },
       });
       // Route stored agent choices to this device's provider before recovery issues any request.
@@ -759,6 +767,7 @@ export class Store {
           cwd: agent.cwd,
           thinkingLevel: agent.thinkingLevel,
           instructions: agent.instructions,
+          extensions: { add: [this.opened.get(row.id)!.addons.all["system-prompts"]] },
         },
       },
       ctx,

@@ -25,6 +25,10 @@ test("REST v1: auth, sessions, agents, messages, waits, idempotency, errors", as
     assert.equal(info.apiVersion, 1);
     assert.deepEqual(info.startDirs, [t.work]);
     assert.equal(info.models[0].id, "echo");
+    assert.deepEqual(info.capabilities.features, ["events", "docs", "demo", "jobs"]);
+    assert.deepEqual(info.capabilities.thinkingLevels, ["off", "minimal", "low", "medium", "high", "xhigh"]);
+    assert.ok(info.capabilities.harnesses.includes("pi"));
+    assert.deepEqual(info.capabilities.prompts, ["smart_ass_opus_fix.md", "one_sentence.md"]);
     await assert.rejects(() => new DpiClient(server.base, "x".repeat(40)).device(), (e: DpiError) => e.code === "unauthorized");
 
     // Directory browsing.

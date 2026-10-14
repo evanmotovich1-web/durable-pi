@@ -216,6 +216,17 @@
 .tree-row.session .name {
   font-weight: 600;
 }
+.tree-row.group {
+  min-height: 28px;
+  color: var(--muted);
+}
+.tree-row.group .name {
+  font-size: 13px;
+  font-weight: 600;
+}
+.tree-row .activity {
+  flex: 0 0 auto;
+}
 .tree-row .ico {
   flex: 0 0 auto;
   color: var(--muted);

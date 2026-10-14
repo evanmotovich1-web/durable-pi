@@ -158,6 +158,11 @@ try {
   await expect(page.locator(".device-chip")).toHaveText("box-b");
   await expect(page.getByText("A conversation with continuity.")).toBeVisible();
   await expect(page.locator(".tree-row.session").filter({ hasText: "UI on B" })).toBeVisible();
+  await expect(page.locator('.tree-row.group[data-key="box-b/active"]')).toContainText("Active");
+  await expect(page.locator(".tree-row.session").filter({ hasText: "UI on B" })).toContainText(
+    /last active \d+ min ago/,
+  );
+  await expect(page.locator('.tree-row.group[data-key="box-b/inactive"]')).toHaveCount(0);
   pass("session created on box-b via the dir browser and selected");
 
   await send("hello there");
@@ -267,7 +272,6 @@ try {
   await expect(chat()).toContainText("jev-damage-control blocked this command", { timeout: 15000 });
   await jevSwitch.click();
   await expect(jevSwitch).toHaveAttribute("aria-checked", "false");
-  await page.getByRole("switch", { name: "System prompts" }).click();
   await jevSwitch.click();
   await expect(page.getByRole("switch", { name: "System prompts" })).toHaveAttribute("aria-checked", "true");
   await expect(jevSwitch).toHaveAttribute("aria-checked", "true");
@@ -440,6 +444,13 @@ try {
   await expect(row("box-b").locator(".dot.off")).toBeVisible({ timeout: 20000 });
   await expect(page.locator(".offline-panel")).toContainText("box-b is offline");
   await expect(page.locator(`.tree-row[data-key="${agentKey}"]`)).toHaveClass(/stale/);
+  await expect(page.locator(".tree-row.session").filter({ hasText: "Renamed B" })).toContainText(
+    "device offline",
+  );
+  await expect(
+    page.locator(".tree-row.session").filter({ hasText: "Renamed B" }).locator(".dot.work"),
+  ).toHaveCount(0);
+  await expect(page.locator('.tree-row.group[data-key="box-b/active"]')).toHaveCount(0);
   b = await backend("box-b", portB, tokenB);
   await expect(row("box-b").locator(".dot.on")).toBeVisible({ timeout: 40000 });
   await expect(page.locator(".offline-panel")).toHaveCount(0);

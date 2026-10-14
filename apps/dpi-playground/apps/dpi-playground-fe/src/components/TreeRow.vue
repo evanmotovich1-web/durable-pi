@@ -13,11 +13,16 @@ import {
   Archive,
 } from "lucide-vue-next";
 import DeviceIcon from "./DeviceIcon.vue";
-import type { TreeNode } from "@sdk/models";
+import {
+  groupLabel,
+  sessionIsActive,
+  sessionStatusLabel,
+  type SidebarNode,
+} from "../client/session-groups";
 import { ago } from "../client/store";
 
 const props = defineProps<{
-  node: TreeNode;
+  node: SidebarNode;
   depth: number;
   open: boolean;
   selected: boolean;
@@ -28,21 +33,32 @@ const emit = defineEmits<{ toggle: []; activate: []; action: [name: string] }>()
 
 const hasChildren = computed(() => props.node.children.length > 0);
 const device = computed(() => (props.node.type === "device" ? props.node.device : undefined));
+const group = computed(() => (props.node.type === "group" ? props.node : undefined));
 const session = computed(() => (props.node.type === "session" ? props.node.session : undefined));
 const agent = computed(() => (props.node.type === "agent" ? props.node.agent : undefined));
-const background = computed(() =>
-  session.value
+const background = computed(() => {
+  if (!props.online) return 0;
+  return session.value
     ? session.value.agents.reduce((n, a) => n + a.background, 0)
-    : (agent.value?.background ?? 0),
+    : (agent.value?.background ?? 0);
+});
+const busy = computed(() => props.online && (session.value?.busy || agent.value?.busy));
+const activityLabel = computed(() =>
+  session.value ? sessionStatusLabel(session.value, props.online) : "",
 );
-const busy = computed(() => session.value?.busy || agent.value?.busy);
+const groupTitle = computed(() =>
+  group.value ? groupLabel(group.value.kind, group.value.count) : "",
+);
 const statusText = computed(() => {
   const d = device.value;
   if (!d) return "";
-  const count = d.tree?.sessions.length ?? 0;
+  const sessions = d.tree?.sessions ?? [];
+  const active = sessions.filter((item) => sessionIsActive(item)).length;
   switch (d.status) {
     case "online":
-      return `${count} session${count === 1 ? "" : "s"}`;
+      return sessions.length - active
+        ? `${active} active`
+        : `${sessions.length} session${sessions.length === 1 ? "" : "s"}`;
     case "checking":
       return "checking…";
     case "unauthorized":
@@ -59,10 +75,18 @@ const dot = computed(() => {
   const s = device.value?.status;
   return s === "online" ? "on" : s === "checking" ? "chk" : s === "offline" ? "off" : "err";
 });
-const label = computed(() => device.value?.id ?? session.value?.name ?? agent.value?.name ?? "");
+const label = computed(() => {
+  if (device.value) return device.value.id;
+  if (group.value) return groupTitle.value;
+  return session.value?.name ?? agent.value?.name ?? "";
+});
 const title = computed(() => {
   if (device.value)
     return `${device.value.name} · ${device.value.url}${device.value.error ? `\n${device.value.error}` : ""}`;
+  if (group.value)
+    return group.value.kind === "active"
+      ? "Live sessions and sessions used in the last 60 minutes"
+      : "Sessions idle for more than 60 minutes";
   if (session.value) return `${session.value.name}\n${session.value.cwd}`;
   const a = agent.value!;
   return a.kind === "fork"
@@ -121,9 +145,13 @@ const title = computed(() => {
         </button>
       </span>
     </template>
+    <template v-else-if="group">
+      <b class="name">{{ groupTitle }}</b>
+    </template>
     <template v-else-if="session">
       <FolderOpen class="ico" :size="16" />
       <b class="name">{{ label }}</b>
+      <span class="meta activity">{{ activityLabel }}</span>
       <span class="path">…/{{ session.cwd.split("/").filter(Boolean).at(-1) }}</span>
       <i v-if="busy" class="dot work" title="Working" />
       <span v-if="background" class="bg-count" :title="`${background} background task(s)`"

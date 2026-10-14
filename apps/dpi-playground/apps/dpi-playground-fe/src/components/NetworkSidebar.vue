@@ -2,9 +2,14 @@
 import { computed, nextTick, ref } from "vue";
 import { Network, PanelLeftClose, PanelLeftOpen } from "lucide-vue-next";
 import DeviceIcon from "./DeviceIcon.vue";
-import type { TreeNode } from "@sdk/models";
 import TreeRow from "./TreeRow.vue";
 import { deviceClient, hub } from "../client/hub";
+import {
+  groupSessions,
+  rowOpen,
+  toggleKey,
+  type SidebarNode,
+} from "../client/session-groups";
 import {
   attempt,
   expanded,
@@ -19,40 +24,44 @@ import {
 } from "../client/store";
 
 interface Row {
-  node: TreeNode;
+  node: SidebarNode;
   depth: number;
   parent?: string;
 }
 
 const rows = computed(() => {
   const out: Row[] = [];
-  const walk = (nodes: TreeNode[], depth: number, parent?: string) => {
+  const walk = (nodes: SidebarNode[], depth: number, parent?: string) => {
     for (const node of nodes) {
       out.push({ node, depth, parent });
-      if (node.children.length && expanded.value.has(node.key))
+      if (node.children.length && rowOpen(node, expanded.value))
         walk(node.children, depth + 1, node.key);
     }
   };
-  walk(network.tree.value, 0);
+  walk(groupSessions(network.tree.value), 0);
   return out;
 });
 const focusKey = ref<string>();
 const list = ref<HTMLElement>();
 
-const deviceOf = (node: TreeNode) =>
+const deviceOf = (node: SidebarNode) =>
   network.devices.value.find(
     (d) => d.id === (node.type === "device" ? node.device.id : node.deviceId),
   );
-const isOnline = (node: TreeNode) => deviceOf(node)?.status === "online";
-const isSelected = (node: TreeNode) =>
+const isOnline = (node: SidebarNode) => deviceOf(node)?.status === "online";
+const isSelected = (node: SidebarNode) =>
   node.type === "agent" &&
   selected.value?.deviceId === node.deviceId &&
   selected.value.sessionId === node.sessionId &&
   selected.value.agentId === node.agent.id;
 
-function activate(node: TreeNode) {
+function toggleRow(node: SidebarNode) {
+  toggle(toggleKey(node));
+}
+
+function activate(node: SidebarNode) {
   focusKey.value = node.key;
-  if (node.type === "device") return toggle(node.key);
+  if (node.type === "device" || node.type === "group") return toggleRow(node);
   if (node.type === "agent")
     return select({ deviceId: node.deviceId, sessionId: node.sessionId, agentId: node.agent.id });
   const root = node.session.agents.find((a) => a.kind === "root") ?? node.session.agents[0];
@@ -60,9 +69,9 @@ function activate(node: TreeNode) {
   if (root) select({ deviceId: node.deviceId, sessionId: node.session.id, agentId: root.id });
 }
 
-async function action(node: TreeNode, name: string) {
+async function action(node: SidebarNode, name: string) {
   const device = deviceOf(node);
-  if (!device) return;
+  if (!device || node.type === "group") return;
   const client = deviceClient(device.id);
   if (node.type === "device") {
     if (name === "new-session") ui.dialog = { kind: "new-session", deviceId: device.id };
@@ -135,10 +144,10 @@ function keydown(e: KeyboardEvent) {
   else if (e.key === "ArrowUp") move(-1);
   else if (e.key === "ArrowRight" && row) {
     if (!row.node.children.length) return;
-    if (expanded.value.has(row.node.key)) move(1);
-    else toggle(row.node.key, true);
+    if (rowOpen(row.node, expanded.value)) move(1);
+    else toggleRow(row.node);
   } else if (e.key === "ArrowLeft" && row) {
-    if (row.node.children.length && expanded.value.has(row.node.key)) toggle(row.node.key, false);
+    if (row.node.children.length && rowOpen(row.node, expanded.value)) toggleRow(row.node);
     else if (row.parent) focusKey.value = row.parent;
   } else if ((e.key === "Enter" || e.key === " ") && row) activate(row.node);
   else return;
@@ -178,11 +187,11 @@ function keydown(e: KeyboardEvent) {
           :key="row.node.key"
           :node="row.node"
           :depth="row.depth"
-          :open="expanded.has(row.node.key)"
+          :open="rowOpen(row.node, expanded)"
           :selected="isSelected(row.node)"
           :focused="focusKey === row.node.key"
           :online="isOnline(row.node)"
-          @toggle="toggle(row.node.key)"
+          @toggle="toggleRow(row.node)"
           @activate="activate(row.node)"
           @action="action(row.node, $event)"
         />

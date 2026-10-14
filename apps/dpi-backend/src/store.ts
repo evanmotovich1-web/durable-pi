@@ -68,6 +68,8 @@ import { ADDON_INFO, createAddons, PROMPTS, PromptChecklist, type Addons } from 
 import { JOB_RUNS_DOC } from "../../dpi-sdk/src/jobs.js";
 import { readBuildRevision } from "./build-revision.js";
 import { claudeCodeAvailable } from "./device-capabilities.js";
+import { backfillSessionActivity } from "./session-activity.js";
+import { readSessionKeepList } from "./session-keep-list.js";
 
 export const DURABLE_VERSION = "1.0.3";
 
@@ -90,9 +92,13 @@ export type SessionRow = {
   cwd: string;
   dbPath: string;
   createdAt: number;
+  lastActivityAt: number;
+  pinned: number;
   model: string;
   provider: string;
 };
+
+export type ArchiveRow = SessionRow & { archiveId: string; archivedAt: number };
 
 export interface StoreOptions {
   dataDir: string;
@@ -102,7 +108,16 @@ export interface StoreOptions {
   credentials?: CredentialStore;
   /** Override the startup login probe in tests; production runs `claude auth status`. */
   claudeCodeProbe?: () => Promise<boolean>;
+  /** Override the active-session recency window in tests. */
+  sessionHideMinutes?: number;
+  /** Clock injection makes idle decisions deterministic in tests. */
+  now?: () => number;
+  /** JSON keep-list or adapter SQLite map. Overrides DPI_SESSION_KEEP_FILE. */
+  keepListFile?: string;
+  archiveHours?: number;
 }
+
+export type SessionStateFilter = "active" | "inactive" | "all";
 
 /** Agent documents a client may read or stream, by kind. */
 /** apps/dpi-backend/src → the checkout root. */
@@ -163,6 +178,15 @@ export class Store {
   uid!: string;
   modelList: ModelInfo[] = [];
   private hasClaudeCode = false;
+  private readonly sessionHideMs: number;
+  private readonly archiveMs: number;
+  private readonly clock: () => number;
+  private readonly keepListFile: string;
+  private readonly keepListRequired: boolean;
+  private sweepTimer?: ReturnType<typeof setInterval>;
+  private sweepPromise?: Promise<string[]>;
+  private archiving = new Set<string>();
+  private activeClients = new Map<string, number>();
   private unlockCatalog: () => void;
   private unlockShared?: () => void;
   private listeners = new Set<() => void>();
@@ -191,6 +215,14 @@ export class Store {
   }
 
   private constructor(readonly options: StoreOptions) {
+    this.clock = options.now ?? Date.now;
+    const minutes = options.sessionHideMinutes ?? Number(process.env.DPI_SESSION_HIDE_MINUTES ?? 60);
+    this.sessionHideMs = Number.isFinite(minutes) && minutes >= 0 ? minutes * 60_000 : 60 * 60_000;
+    const hours = options.archiveHours ?? Number(process.env.DPI_SESSION_ARCHIVE_HOURS ?? 12);
+    this.archiveMs = Number.isFinite(hours) && hours > 0 ? hours * 3_600_000 : 12 * 3_600_000;
+    this.keepListFile = options.keepListFile ?? process.env.DPI_SESSION_KEEP_FILE
+      ?? join(homedir(), "code", "dpi-network", "pilot", "map.sqlite");
+    this.keepListRequired = options.keepListFile !== undefined || process.env.DPI_SESSION_KEEP_FILE !== undefined;
     this.credentials = options.provider === "native" ? (options.credentials ?? new PiAuthStore()) : undefined;
     this.models = createModels({ credentials: this.credentials });
     // Old faux sessions must still open when a device switches to native providers.
@@ -202,12 +234,21 @@ export class Store {
     this.unlockCatalog = lockFile(`${this.catalogPath}.lock`);
     this.catalog = new DatabaseSync(this.catalogPath);
     this.catalog.exec(`PRAGMA journal_mode=WAL;
-      CREATE TABLE IF NOT EXISTS sessions(id TEXT PRIMARY KEY,name TEXT NOT NULL,cwd TEXT NOT NULL,dbPath TEXT NOT NULL UNIQUE,createdAt INTEGER NOT NULL,model TEXT NOT NULL,provider TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS sessions(id TEXT PRIMARY KEY,name TEXT NOT NULL,cwd TEXT NOT NULL,dbPath TEXT NOT NULL UNIQUE,createdAt INTEGER NOT NULL,model TEXT NOT NULL,provider TEXT NOT NULL,lastActivityAt INTEGER,pinned INTEGER NOT NULL DEFAULT 0);
+      CREATE TABLE IF NOT EXISTS archived_sessions(archiveId TEXT PRIMARY KEY,id TEXT NOT NULL UNIQUE,name TEXT NOT NULL,cwd TEXT NOT NULL,dbPath TEXT NOT NULL,createdAt INTEGER NOT NULL,model TEXT NOT NULL,provider TEXT NOT NULL,lastActivityAt INTEGER NOT NULL,pinned INTEGER NOT NULL,archivedAt INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS conversation_names(sessionId TEXT NOT NULL,conversationId INTEGER NOT NULL,name TEXT NOT NULL,PRIMARY KEY(sessionId,conversationId));
       CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY,value TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS requests(key TEXT PRIMARY KEY,route TEXT NOT NULL,status INTEGER NOT NULL,body TEXT NOT NULL,createdAt INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS session_spawns(key TEXT PRIMARY KEY,sessionId TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS session_compaction(sessionId TEXT PRIMARY KEY,settings TEXT NOT NULL);`);
+    const columns = this.catalog.prepare("PRAGMA table_info(sessions)").all() as { name: string }[];
+    if (!columns.some((column) => column.name === "lastActivityAt"))
+      this.catalog.exec("ALTER TABLE sessions ADD COLUMN lastActivityAt INTEGER");
+    if (!columns.some((column) => column.name === "pinned"))
+      this.catalog.exec("ALTER TABLE sessions ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0");
+    for (const row of this.catalog.prepare("SELECT id,dbPath,createdAt FROM sessions WHERE lastActivityAt IS NULL OR lastActivityAt=createdAt").all() as SessionRow[])
+      this.catalog.prepare("UPDATE sessions SET lastActivityAt=max(coalesce(lastActivityAt,0),?) WHERE id=?")
+        .run(backfillSessionActivity(row.dbPath, row.createdAt), row.id);
     const uid = this.catalog.prepare("SELECT value FROM meta WHERE key='device_uid'").get() as
       | { value: string }
       | undefined;
@@ -226,6 +267,7 @@ export class Store {
       store.shared.harness.subscribeCommits(() => store.notify());
       store.modelList = await store.loadModels();
       store.hasClaudeCode = await (options.claudeCodeProbe ?? claudeCodeAvailable)().catch(() => false);
+      await store.indexLegacyArchives();
       for (const row of store.list()) {
         try {
           await store.openAgent(row);
@@ -236,6 +278,11 @@ export class Store {
       if (!(await store.shared.initialized()))
         await store.shared.initialize({ goal: "Explore durable agents", counter: 0, notes: [] });
       for (const { harness } of store.opened.values()) harness.resume();
+      await store.sweepArchives().catch((error) => console.error("[session-archive] startup sweep failed:", error));
+      store.sweepTimer = setInterval(() => {
+        void store.sweepArchives().catch((error) => console.error("[session-archive] sweep failed:", error));
+      }, 15 * 60_000);
+      store.sweepTimer.unref();
       return store;
     } catch (e) {
       await store.close().catch(() => {});
@@ -393,6 +440,17 @@ export class Store {
     return this.catalog.prepare("SELECT * FROM sessions ORDER BY createdAt DESC").all() as SessionRow[];
   }
 
+  private touchSession(id: string, at = this.clock()) {
+    this.catalog.prepare("UPDATE sessions SET lastActivityAt=max(coalesce(lastActivityAt,0),?) WHERE id=?").run(at, id);
+    this.notify();
+  }
+
+  matchesSessionState(session: SessionSummary, state: SessionStateFilter): boolean {
+    if (state === "all") return true;
+    const active = session.live || session.pinned || session.lastActivityAt >= this.clock() - this.sessionHideMs;
+    return state === "active" ? active : !active;
+  }
+
   row(id: string): SessionRow {
     const row = this.catalog.prepare("SELECT * FROM sessions WHERE id=?").get(id) as SessionRow | undefined;
     if (!row) throw notFound(`No session ${id}`);
@@ -413,6 +471,7 @@ export class Store {
   }
 
   harness(row: SessionRow) {
+    if (this.archiving.has(row.id)) throw new ApiFault("unavailable", `Session ${row.name} is being archived`);
     const h = this.opened.get(row.id)?.harness;
     if (!h) throw new ApiFault("unavailable", this.errors.get(row.id) ?? `Session ${row.name} is unavailable`);
     return h;
@@ -435,12 +494,15 @@ export class Store {
     if (body.thinkingLevel !== undefined && !THINKING_LEVELS.includes(body.thinkingLevel))
       throw invalid("Invalid thinking level");
     const id = randomUUID();
+    const createdAt = this.clock();
     const row: SessionRow = {
       id,
       name: body.name.trim().slice(0, 100) || "Untitled session",
       cwd,
       dbPath: join(this.sessionsDir, id, "agent.sqlite"),
-      createdAt: Date.now(),
+      createdAt,
+      lastActivityAt: createdAt,
+      pinned: 0,
       model: model.modelId,
       provider: model.provider,
     };
@@ -448,8 +510,8 @@ export class Store {
     this.catalog.exec("BEGIN");
     try {
       this.catalog
-        .prepare("INSERT INTO sessions VALUES(?,?,?,?,?,?,?)")
-        .run(id, row.name, cwd, row.dbPath, row.createdAt, row.model, row.provider);
+        .prepare("INSERT INTO sessions(id,name,cwd,dbPath,createdAt,model,provider,lastActivityAt,pinned) VALUES(?,?,?,?,?,?,?,?,?)")
+        .run(id, row.name, cwd, row.dbPath, row.createdAt, row.model, row.provider, row.lastActivityAt, row.pinned);
       if (spawnKey) this.catalog.prepare("INSERT OR REPLACE INTO session_spawns VALUES(?,?)").run(spawnKey, id);
       this.catalog.exec("COMMIT");
     } catch (e) {
@@ -488,34 +550,192 @@ export class Store {
     return this.sessionSummary(this.row(row.id));
   }
 
+  pin(row: SessionRow, pinned: unknown) {
+    if (typeof pinned !== "boolean") throw invalid("pinned must be true or false");
+    this.catalog.prepare("UPDATE sessions SET pinned=? WHERE id=?").run(pinned ? 1 : 0, row.id);
+    this.notify();
+    return this.sessionSummary(this.row(row.id));
+  }
+
+  /** Hold a session while a send or wait HTTP request is open. */
+  async withSessionClient<T>(id: string, action: () => Promise<T>): Promise<T> {
+    if (this.archiving.has(id)) throw new ApiFault("unavailable", `Session ${id} is being archived`);
+    this.activeClients.set(id, (this.activeClients.get(id) ?? 0) + 1);
+    try {
+      return await action();
+    } finally {
+      const remaining = (this.activeClients.get(id) ?? 1) - 1;
+      if (remaining) this.activeClients.set(id, remaining);
+      else this.activeClients.delete(id);
+    }
+  }
+
+  archived() {
+    return (this.catalog.prepare("SELECT archiveId,id,name,archivedAt,lastActivityAt FROM archived_sessions ORDER BY archivedAt DESC").all() as
+      Pick<ArchiveRow, "archiveId" | "id" | "name" | "archivedAt" | "lastActivityAt">[]);
+  }
+
+  /** Older DELETE /sessions moves kept the files but discarded catalog metadata. Index those folders once. */
+  private async indexLegacyArchives() {
+    const dirs = await readdir(this.archiveDir, { withFileTypes: true }).catch((error: NodeJS.ErrnoException) => {
+      if (error.code === "ENOENT") return [];
+      throw error;
+    });
+    for (const dir of dirs) {
+      if (!dir.isDirectory()) continue;
+      const match = /^([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})-(\d{13})(?:-[0-9a-f]{8})?$/.exec(dir.name);
+      if (!match || this.catalog.prepare("SELECT 1 FROM archived_sessions WHERE archiveId=?").get(dir.name)) continue;
+      const [, id, stamp] = match;
+      if (this.catalog.prepare("SELECT 1 FROM sessions WHERE id=?").get(id)) continue;
+      const dbPath = join(this.archiveDir, dir.name, "agent.sqlite");
+      let db: DatabaseSync | undefined;
+      try {
+        db = new DatabaseSync(dbPath, { readOnly: true });
+        const result = db.prepare("SELECT r.content FROM documents d JOIN document_revisions r ON d.id=r.document_id WHERE d.kind='\"pi.agent\"' ORDER BY r.seq DESC LIMIT 1").get() as { content: string } | undefined;
+        if (!result) continue;
+        const agent = JSON.parse(result.content) as { cwd?: unknown; model?: { provider?: unknown; modelId?: unknown } };
+        if (typeof agent.cwd !== "string" || typeof agent.model?.provider !== "string" || typeof agent.model.modelId !== "string") continue;
+        const archivedAt = Number(stamp);
+        const lastActivityAt = backfillSessionActivity(dbPath, 0) || archivedAt;
+        this.catalog.prepare("INSERT OR IGNORE INTO archived_sessions VALUES(?,?,?,?,?,?,?,?,?,?,?)")
+          .run(dir.name, id, id, agent.cwd, join(this.sessionsDir, id, "agent.sqlite"), lastActivityAt,
+            agent.model.modelId, agent.model.provider, lastActivityAt, 0, archivedAt);
+      } catch (error) {
+        console.error("[session-archive] could not index legacy archive", dir.name, error);
+      } finally {
+        db?.close();
+      }
+    }
+  }
+
+  /** Runs at startup and every 15 minutes. A missing configured keep-list stops the sweep. */
+  async sweepArchives() {
+    if (this.sweepPromise) return [];
+    const work = this.runArchiveSweep();
+    this.sweepPromise = work;
+    try {
+      return await work;
+    } finally {
+      this.sweepPromise = undefined;
+    }
+  }
+
+  private async runArchiveSweep() {
+    const archived: string[] = [];
+    const keep = readSessionKeepList(this.keepListFile, this.keepListRequired);
+    for (const row of this.list()) {
+      try {
+        if (row.pinned || keep.has(row.id) || keep.has(row.name) || this.activeClients.has(row.id)) continue;
+        const idleHours = (this.clock() - row.lastActivityAt) / 3_600_000;
+        if (idleHours <= this.archiveMs / 3_600_000) continue;
+        const summary = await this.sessionSummary(row);
+        if (summary.live || summary.error) continue;
+        await this.archive(row);
+        archived.push(row.id);
+        console.info("[session-archive]", JSON.stringify({ id: row.id, name: row.name, idleHours: Number(idleHours.toFixed(2)) }));
+      } catch (error) {
+        console.error("[session-archive] skipped", row.id, error);
+      }
+    }
+    return archived;
+  }
+
   /** Stop all work, close the harness and move its files to archive/. Nothing is deleted. */
   async archive(row: SessionRow) {
+    row = this.row(row.id);
+    if (this.archiving.has(row.id)) throw new ApiFault("busy", `Session ${row.name} is already being archived`);
+    const keep = readSessionKeepList(this.keepListFile, this.keepListRequired);
+    if (row.pinned || keep.has(row.id) || keep.has(row.name))
+      throw new ApiFault("conflict", `Session ${row.name} is protected from archiving`);
+    if (this.activeClients.has(row.id)) throw new ApiFault("busy", `Session ${row.name} has an open client request`);
+    const summary = await this.sessionSummary(row);
+    if (summary.live || summary.error) throw new ApiFault("busy", `Session ${row.name} has live or unavailable work`);
+    this.archiving.add(row.id);
     const opened = this.opened.get(row.id);
-    if (opened) {
-      for (const record of await this.scanAll(opened.harness)) {
-        const c = await opened.harness.conversation(record.id, ctx);
-        if (c) await c.abort(ctx, { background: true }).catch(() => {});
-      }
-      opened.unsubscribe();
-      try {
-        await opened.harness.close(ctx);
-      } finally {
-        opened.unlock();
-      }
-      this.opened.delete(row.id);
-    }
-    await mkdir(this.archiveDir, { recursive: true });
-    const target = join(this.archiveDir, `${row.id}-${Date.now()}`);
+    const archivedAt = this.clock();
+    const archiveId = `${row.id}-${archivedAt}-${randomUUID().slice(0, 8)}`;
+    const target = join(this.archiveDir, archiveId);
+    const source = dirname(row.dbPath);
+    let moved = false;
     try {
-      await renamePath(dirname(row.dbPath), target);
+      if (this.activeClients.has(row.id)) throw new ApiFault("busy", `Session ${row.name} has an open client request`);
+      if (opened) {
+        const inspection = await opened.harness.inspect(ctx);
+        if (inspection.tasks.length || inspection.submissions.length)
+          throw new ApiFault("busy", `Session ${row.name} became busy`);
+      }
+      if (opened) {
+        opened.unsubscribe();
+        try {
+          await opened.harness.close(ctx);
+        } finally {
+          opened.unlock();
+          this.opened.delete(row.id);
+        }
+      }
+      await mkdir(this.archiveDir, { recursive: true });
+      await renamePath(source, target);
+      moved = true;
+      this.catalog.exec("BEGIN");
+      try {
+        this.catalog.prepare("INSERT INTO archived_sessions VALUES(?,?,?,?,?,?,?,?,?,?,?)")
+          .run(archiveId, row.id, row.name, row.cwd, row.dbPath, row.createdAt, row.model, row.provider, row.lastActivityAt, row.pinned, archivedAt);
+        this.catalog.prepare("DELETE FROM sessions WHERE id=?").run(row.id);
+        this.catalog.exec("COMMIT");
+      } catch (error) {
+        this.catalog.exec("ROLLBACK");
+        throw error;
+      }
     } catch (e) {
-      if ((e as NodeJS.ErrnoException).code !== "ENOENT") throw e;
+      if (moved) await renamePath(target, source).catch((error) => console.error("[session-archive] file rollback failed:", error));
+      if (opened && !this.opened.has(row.id)) await this.openAgent(row).catch((error) => this.errors.set(row.id, String(error)));
+      throw e;
+    } finally {
+      this.archiving.delete(row.id);
     }
-    this.catalog.prepare("DELETE FROM conversation_names WHERE sessionId=?").run(row.id);
-    this.catalog.prepare("DELETE FROM sessions WHERE id=?").run(row.id);
     this.errors.delete(row.id);
     this.notify();
-    return { archived: target };
+    return { archived: target, archiveId };
+  }
+
+  /** Move an archived session back under sessions/, then reopen its original agent.sqlite. */
+  async restore(archiveId: string) {
+    const row = this.catalog.prepare("SELECT * FROM archived_sessions WHERE archiveId=?").get(archiveId) as ArchiveRow | undefined;
+    if (!row) throw notFound(`No archive ${archiveId}`);
+    if (this.catalog.prepare("SELECT 1 FROM sessions WHERE id=?").get(row.id))
+      throw new ApiFault("conflict", `Session ${row.id} already exists`);
+    const source = join(this.archiveDir, archiveId);
+    const target = dirname(row.dbPath);
+    try {
+      await stat(target);
+      throw new ApiFault("conflict", `Session folder ${row.id} already exists`);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    }
+    await mkdir(this.sessionsDir, { recursive: true });
+    await renamePath(source, target);
+    try {
+      this.catalog.exec("BEGIN");
+      try {
+        this.catalog.prepare("INSERT INTO sessions(id,name,cwd,dbPath,createdAt,model,provider,lastActivityAt,pinned) VALUES(?,?,?,?,?,?,?,?,?)")
+          .run(row.id, row.name, row.cwd, row.dbPath, row.createdAt, row.model, row.provider, row.lastActivityAt, row.pinned);
+        this.catalog.prepare("DELETE FROM archived_sessions WHERE archiveId=?").run(archiveId);
+        this.catalog.exec("COMMIT");
+      } catch (error) {
+        this.catalog.exec("ROLLBACK");
+        throw error;
+      }
+    } catch (error) {
+      await renamePath(target, source).catch((rollbackError) => console.error("[session-archive] restore rollback failed:", rollbackError));
+      throw error;
+    }
+    try {
+      await this.openAgent(this.row(row.id));
+    } catch (error) {
+      this.errors.set(row.id, String(error));
+    }
+    this.notify();
+    return this.sessionSummary(this.row(row.id));
   }
 
   async openAgent(row: SessionRow, create = false, thinkingLevel: ThinkingLevel = "low") {
@@ -577,7 +797,14 @@ export class Store {
       row.provider = rootModel.provider;
       row.model = rootModel.modelId;
       this.catalog.prepare("UPDATE sessions SET provider=?,model=? WHERE id=?").run(row.provider, row.model, row.id);
-      const unsubscribe = harness.subscribeCommits(() => this.notify());
+      // Durable commits cover submission admission, turn/task transitions, and conversation creation.
+      // A deduplicated submit has no new commit, so a retry does not make an idle session look active.
+      const unsubscribe = harness.subscribeCommits((publication) => {
+        if (publication.changes.some((change) =>
+          change.type === "entry" || change.type === "task" || change.type === "submission" || change.type === "conversation"))
+          this.touchSession(row.id);
+        else this.notify();
+      });
       this.opened.set(row.id, { harness, unlock, unsubscribe, jobs, addons });
       this.errors.delete(row.id);
       if (create) harness.resume();
@@ -773,6 +1000,7 @@ export class Store {
       ctx,
     );
     if (typeof body.name === "string" && body.name.trim()) this.setAgentName(row, other.id as number, body.name);
+    this.touchSession(row.id);
     this.notify();
     return this.agentSummary(row, other);
   }
@@ -785,6 +1013,7 @@ export class Store {
     const agent = await fork.agent(ctx);
     await fork.configure({ model: this.routedModel(agent.model) }, ctx);
     if (typeof body.name === "string" && body.name.trim()) this.setAgentName(row, fork.id as number, body.name);
+    this.touchSession(row.id);
     this.notify();
     return this.agentSummary(row, fork);
   }
@@ -1101,6 +1330,8 @@ export class Store {
       cwd: row.cwd,
       model: row.model,
       createdAt: row.createdAt,
+      lastActivityAt: row.lastActivityAt,
+      pinned: !!row.pinned,
       dbPath: row.dbPath,
       compaction: this.compactionOf(row.id),
     };
@@ -1108,13 +1339,23 @@ export class Store {
 
   async sessionSummary(row: SessionRow): Promise<SessionSummary> {
     if (!this.opened.has(row.id))
-      return { ...this.sessionSummaryBase(row), busy: false, agents: [], error: this.errors.get(row.id) ?? "Session unavailable" };
-    const agents = await this.agents(row);
-    return { ...this.sessionSummaryBase(row), busy: agents.some((a) => a.busy), agents };
+      return { ...this.sessionSummaryBase(this.row(row.id)), busy: false, live: false, agents: [], error: this.errors.get(row.id) ?? "Session unavailable" };
+    const h = this.harness(row);
+    const tasks = await this.liveTasks(h);
+    const agents = await this.agents(row, tasks);
+    const inspection = await h.inspect(ctx);
+    return {
+      ...this.sessionSummaryBase(this.row(row.id)),
+      busy: agents.some((a) => a.busy),
+      live: agents.some((a) => a.busy || a.background > 0) || tasks.length > 0 || inspection.tasks.length > 0
+        || inspection.submissions.some((submission) => submission.status === "queued" || submission.status === "placed"),
+      agents,
+    };
   }
 
-  async tree(): Promise<DeviceTree> {
-    const sessions = await Promise.all(this.list().map((row) => this.sessionSummary(row)));
+  async tree(state: SessionStateFilter = "all"): Promise<DeviceTree> {
+    const sessions = (await Promise.all(this.list().map((row) => this.sessionSummary(row))))
+      .filter((session) => this.matchesSessionState(session, state));
     return { uid: this.uid, name: this.name, sessions, at: Date.now() };
   }
 
@@ -1197,6 +1438,8 @@ export class Store {
   // ------------------------------------------------------------ lifecycle
 
   async close() {
+    if (this.sweepTimer) clearInterval(this.sweepTimer);
+    if (this.sweepPromise) await this.sweepPromise.catch(() => {});
     for (const { harness, unlock, unsubscribe } of this.opened.values()) {
       unsubscribe();
       try {

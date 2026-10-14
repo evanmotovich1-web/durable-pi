@@ -190,7 +190,7 @@ test("session lineage and network tree nest forks and subagents", () => {
     source: "config",
     hasToken: true,
     status: "online",
-    tree: { uid: "u", name: "box", at: 1, sessions: [{ id: "s1", name: "S", cwd: "/w", model: "m", createdAt: 1, dbPath: "/d", busy: true, agents }] },
+    tree: { uid: "u", name: "box", at: 1, sessions: [{ id: "s1", name: "S", cwd: "/w", model: "m", createdAt: 1, lastActivityAt: 1, live: true, pinned: false, dbPath: "/d", busy: true, agents }] },
   };
   const [root] = networkTree([device]);
   const sessionNode = root.children[0];

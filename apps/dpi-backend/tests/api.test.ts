@@ -40,6 +40,17 @@ test("REST v1: auth, sessions, agents, messages, waits, idempotency, errors", as
     await assert.rejects(() => client.createSession({ name: "x", cwd: "/definitely/missing", model: faux }), (e: DpiError) => e.code === "invalid");
     const key = "create-1";
     const s1 = await client.createSession({ name: "Alpha", cwd: t.work, model: faux }, key);
+    assert.equal(s1.live, false);
+    assert.ok(s1.lastActivityAt >= s1.createdAt);
+    const auth = { authorization: `Bearer ${token}` };
+    const activeTree = await (await fetch(`${server.base}/v1/tree?state=active`, { headers: auth })).json();
+    assert.equal(activeTree.sessions[0].id, s1.id);
+    assert.equal(typeof activeTree.sessions[0].lastActivityAt, "number");
+    assert.equal(typeof activeTree.sessions[0].live, "boolean");
+    const activeList = await (await fetch(`${server.base}/v1/sessions?state=active`, { headers: auth })).json();
+    assert.equal(activeList[0].id, s1.id);
+    assert.equal((await fetch(`${server.base}/v1/sessions/${s1.id}?state=inactive`, { headers: auth })).status, 404);
+    assert.equal((await fetch(`${server.base}/v1/tree?state=unknown`, { headers: auth })).status, 400);
     const s1again = await client.createSession({ name: "Alpha", cwd: t.work, model: faux }, key);
     assert.equal(s1again.id, s1.id);
     assert.equal((await client.sessions()).length, 1);

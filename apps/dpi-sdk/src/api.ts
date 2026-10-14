@@ -118,6 +118,12 @@ export interface SessionSummary {
   cwd: string;
   model: string;
   createdAt: number;
+  /** Latest recorded work time in epoch milliseconds. Older Pi Durable records without timestamps use createdAt. */
+  lastActivityAt: number;
+  /** True while an agent, task, or submission has unfinished work. */
+  live: boolean;
+  /** Pinned sessions stay visible and are never archived automatically. */
+  pinned: boolean;
   dbPath: string;
   busy: boolean;
   error?: string;

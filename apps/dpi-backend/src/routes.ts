@@ -2,10 +2,10 @@
 // unique name; agent refs are a numeric id, `main`, or a unique name.
 import { Router, type Request, type Response, type NextFunction } from "express";
 import type { Conversation, Harness } from "@earendil-works/pi-durable";
-import { DEVICE_DOC_KINDS, type SessionRow, type Store } from "./store.js";
+import { DEVICE_DOC_KINDS, type SessionRow, type SessionStateFilter, type Store } from "./store.js";
 import { agentStream, deviceStream, sessionStream } from "./streams.js";
 import { idempotent } from "./idempotency.js";
-import { invalid } from "./errors.js";
+import { invalid, notFound } from "./errors.js";
 
 type Async = (req: Request, res: Response) => Promise<unknown>;
 const route = (fn: Async) => (req: Request, res: Response, next: NextFunction) => fn(req, res).catch(next);
@@ -21,6 +21,12 @@ const int = (value: unknown, name: string) => {
   const n = Number(value);
   if (!Number.isSafeInteger(n)) throw invalid(`${name} must be an integer`);
   return n;
+};
+const sessionState = (req: Request): SessionStateFilter => {
+  const state = req.query.state ?? "all";
+  if (state !== "active" && state !== "inactive" && state !== "all")
+    throw invalid("state must be active, inactive or all");
+  return state;
 };
 
 export function v1(store: Store) {
@@ -50,7 +56,7 @@ export function v1(store: Store) {
 
   // ---------------------------------------------------------- device
   r.get("/device", (_req, res) => res.json(store.deviceInfo()));
-  r.get("/tree", route(async (_req, res) => res.json(await store.tree())));
+  r.get("/tree", route(async (req, res) => res.json(await store.tree(sessionState(req)))));
   r.get("/events", (req, res, next) => {
     try {
       deviceStream(store, req, res);
@@ -69,13 +75,26 @@ export function v1(store: Store) {
   );
 
   // ---------------------------------------------------------- sessions
-  r.get("/sessions", route(async (_req, res) => res.json((await store.tree()).sessions)));
+  r.get("/sessions", route(async (req, res) => res.json((await store.tree(sessionState(req))).sessions)));
   r.post("/sessions", create, route(async (req, res) => res.status(201).json(await store.create(req.body ?? {}))));
-  r.get("/sessions/:s", route(async (_req, res) => res.json(await store.sessionSummary(L(res).row))));
-  r.patch("/sessions/:s", route(async (req, res) => res.json(await store.rename(L(res).row, req.body?.name))));
+  r.get("/sessions/:s", route(async (req, res) => {
+    const session = await store.sessionSummary(L(res).row);
+    if (!store.matchesSessionState(session, sessionState(req))) throw notFound(`No session ${session.id} in that state`);
+    res.json(session);
+  }));
+  r.patch("/sessions/:s", route(async (req, res) => {
+    const body = req.body ?? {};
+    if (body.pinned !== undefined && typeof body.pinned !== "boolean") throw invalid("pinned must be true or false");
+    if (body.name !== undefined && (typeof body.name !== "string" || !body.name.trim())) throw invalid("A name is required");
+    if (body.pinned === undefined && body.name === undefined) throw invalid("name or pinned is required");
+    if (body.pinned !== undefined) await store.pin(L(res).row, body.pinned);
+    res.json(body.name !== undefined ? await store.rename(L(res).row, body.name) : await store.sessionSummary(L(res).row));
+  }));
   r.get("/sessions/:s/compaction", route(async (_req, res) => res.json(store.compactionOf(L(res).row.id))));
   r.patch("/sessions/:s/compaction", route(async (req, res) => res.json(store.setCompaction(L(res).row, req.body ?? {}))));
   r.delete("/sessions/:s", route(async (_req, res) => res.json(await store.archive(L(res).row))));
+  r.get("/archive", (_req, res) => res.json(store.archived()));
+  r.post("/archive/:archiveId/restore", route(async (req, res) => res.json(await store.restore(param(req, "archiveId")))));
   r.get("/sessions/:s/events", route(async (_req, res) => sessionStream(store, L(res).row, res)));
   r.get(
     "/sessions/:s/tasks",
@@ -94,7 +113,7 @@ export function v1(store: Store) {
   r.get("/sessions/:s/inspect", route(async (_req, res) => res.json(await store.inspect(store.harness(L(res).row)))));
   r.get(
     "/sessions/:s/submissions/:id",
-    route(async (req, res) => {
+    route(async (req, res) => store.withSessionClient(L(res).row.id, async () => {
       const closed = new AbortController();
       res.on("close", () => closed.abort());
       res.json(
@@ -105,7 +124,7 @@ export function v1(store: Store) {
           closed.signal,
         ),
       );
-    }),
+    })),
   );
 
   // ---------------------------------------------------------- agents
@@ -136,7 +155,7 @@ export function v1(store: Store) {
   r.get(`${a}/transcript`, route(async (req, res) => res.json(await store.transcript(L(res).c, String(req.query.format ?? "json")))));
   r.post(
     `${a}/messages`,
-    route(async (req, res) => {
+    route(async (req, res) => store.withSessionClient(L(res).row.id, async () => {
       const { h, c } = L(res);
       const submission = await store.send(c, req.body ?? {});
       const waitMs = Number(req.body?.waitMs ?? 0) || 0;
@@ -145,7 +164,7 @@ export function v1(store: Store) {
       res.on("close", () => closed.abort());
       const result = await store.settled(h, submission.id as number, waitMs, closed.signal);
       res.status(result.status === "done" || result.status === "unanswered" ? 200 : 202).json(result);
-    }),
+    })),
   );
   r.delete(
     `${a}/inbox/:submissionId`,

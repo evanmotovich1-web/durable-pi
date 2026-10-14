@@ -4,6 +4,7 @@ import { computed, reactive, ref, shallowRef, watch } from "vue";
 import type { AgentDetail, ModelInfo, NetworkDevice, TaskNode } from "@sdk/api";
 import { sumUsage } from "@sdk/transcript";
 import { lineage } from "@sdk/models";
+import { sessionIsActive } from "./session-groups";
 import { HubStream } from "./stream";
 import { deviceClient, hub, message } from "./hub";
 import { useAgent, useDevice, useNetwork, useSession, type AgentTarget } from "./composables";
@@ -61,15 +62,17 @@ let pendingReveal = false;
 function reveal() {
   const t = selected.value;
   if (!pendingReveal || !t) return;
-  const agents = network.devices.value
-    .find((d) => d.id === t.deviceId)
-    ?.tree?.sessions.find((s) => s.id === t.sessionId)?.agents;
+  const device = network.devices.value.find((d) => d.id === t.deviceId);
+  const session = device?.tree?.sessions.find((s) => s.id === t.sessionId);
+  const agents = session?.agents;
   const byId = new Map((agents ?? []).map((a) => [a.id, a]));
   const keys = [
     t.deviceId,
     `${t.deviceId}/s/${t.sessionId}`,
     `${t.deviceId}/s/${t.sessionId}/a/${t.agentId}`,
   ];
+  if (device?.status === "online" && session && !sessionIsActive(session))
+    keys.push(`${t.deviceId}/inactive`);
   let current = byId.get(t.agentId);
   const seen = new Set<number>();
   while (current && !seen.has(current.id)) {
@@ -79,8 +82,11 @@ function reveal() {
     keys.push(`${t.deviceId}/s/${t.sessionId}/a/${parent}`);
     current = byId.get(parent);
   }
-  if (keys.some((k) => !expanded.value.has(k)))
-    expanded.value = new Set([...expanded.value, ...keys]);
+  const next = new Set([...expanded.value, ...keys]);
+  if (device?.status === "online" && session && sessionIsActive(session))
+    next.delete(`hide:${t.deviceId}/active`);
+  if (next.size !== expanded.value.size || [...next].some((k) => !expanded.value.has(k)))
+    expanded.value = next;
   if (byId.has(t.agentId)) pendingReveal = false;
 }
 watch(() => network.devices.value, reveal);
@@ -138,7 +144,10 @@ export async function boot() {
 /** With nothing saved, open the first agent on the first online device that has a session. */
 function autoSelect(devices: NetworkDevice[]) {
   for (const d of devices) {
-    const s = d.status === "online" ? d.tree?.sessions[0] : undefined;
+    if (d.status !== "online") continue;
+    const s = [...(d.tree?.sessions ?? [])]
+      .filter((session) => sessionIsActive(session))
+      .sort((a, b) => (b.lastActivityAt || b.createdAt) - (a.lastActivityAt || a.createdAt))[0];
     const a = s?.agents.find((x) => x.kind === "root") ?? s?.agents[0];
     if (s && a) return select({ deviceId: d.id, sessionId: s.id, agentId: a.id });
   }

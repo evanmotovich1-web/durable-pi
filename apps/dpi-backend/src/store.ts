@@ -753,7 +753,7 @@ export class Store {
       const compaction = () => this.compactionOf(row.id);
       const playground = createPlayground(this.shared, row.id, this.spawnSession, jobs);
       registry.install(playground);
-      // Only system-prompts is selected for newly created agents. Existing agents retain their stored selection.
+      // system-prompts and jev-damage-control are selected for newly created agents. Existing agents retain their stored selection.
       const addons = createAddons({ offline: this.options.provider === "faux" });
       for (const extension of addons.list) registry.install(extension);
       const harness = await Harness.open(
@@ -783,7 +783,9 @@ export class Store {
           cwd: row.cwd,
           model: { provider: row.provider, modelId: row.model },
           thinkingLevel,
-          ...(create ? { extensions: { add: [addons.all["system-prompts"]] } } : {}),
+          ...(create
+            ? { extensions: { add: [addons.all["system-prompts"], addons.all["jev-damage-control"]] } }
+            : {}),
         },
       });
       // Route stored agent choices to this device's provider before recovery issues any request.
@@ -987,6 +989,7 @@ export class Store {
     const h = this.harness(row);
     const source = await this.resolveAgent(row.id, String(body.from ?? 1));
     const agent = await source.c.agent(ctx);
+    const addons = this.opened.get(row.id)!.addons.all;
     const other = await h.createConversation(
       {
         ownership: { kind: "ownerless" },
@@ -995,7 +998,7 @@ export class Store {
           cwd: agent.cwd,
           thinkingLevel: agent.thinkingLevel,
           instructions: agent.instructions,
-          extensions: { add: [this.opened.get(row.id)!.addons.all["system-prompts"]] },
+          extensions: { add: [addons["system-prompts"], addons["jev-damage-control"]] },
         },
       },
       ctx,

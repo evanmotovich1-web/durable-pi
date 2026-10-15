@@ -1,6 +1,10 @@
 import type { SharedState } from "./shared-state.js";
 import { Type } from "@earendil-works/pi-ai";
-import { isAbsolute, resolve } from "node:path";
+import { execFile } from "node:child_process";
+import { existsSync } from "node:fs";
+import { homedir } from "node:os";
+import { isAbsolute, join, resolve } from "node:path";
+import { promisify } from "node:util";
 import { readState, type AppState } from "../../dpi-sdk/src/app-state.js";
 import type { SessionSummary, ThinkingLevel } from "../../dpi-sdk/src/api.js";
 import { THINKING_LEVELS } from "../../dpi-sdk/src/api.js";
@@ -19,6 +23,25 @@ import {
 import type { Context } from "@earendil-works/chord";
 import { JobRuns, jobDef, resolveJobInput, type Jobs } from "./jobs.js";
 import { searchHistory } from "./history.js";
+
+const execFileAsync = promisify(execFile);
+
+export function resolveVaultSemantic(): { cmd: string; prefix: string[] } | undefined {
+  const home = homedir();
+  const bin = join(home, ".local", "bin", "vault-semantic");
+  if (existsSync(bin)) return { cmd: bin, prefix: [] };
+  const script = [
+    join(home, "code", "second-brain", "tools", "vault_semantic.py"),
+    join(home, "second-brain", "tools", "vault_semantic.py"),
+  ].find((p) => existsSync(p));
+  if (!script) return undefined;
+  const py =
+    [
+      join(home, ".local", "share", "vault-semantic", ".venv", "bin", "python"),
+      join(home, ".local", "share", "vault-semantic", ".venv", "Scripts", "python.exe"),
+    ].find((p) => existsSync(p)) ?? (process.platform === "win32" ? "python" : "python3");
+  return { cmd: py, prefix: [script] };
+}
 
 export const Workspace = defineDoc<AppState>({
   kind: "demo.workspace",
@@ -483,6 +506,41 @@ export function createPlayground(shared: SharedState, sessionId: string, spawn: 
       control: { handoff: args.note },
     }),
   });
+  const vaultSearch = defineTool({
+    name: "vault_search",
+    description:
+      "Search the second-brain vault using hybrid embeddings and Jev batched reranking. Returns verified notes and snippets.",
+    parameters: Type.Object({
+      query: Type.String({ description: "Question or topic to search in the vault." }),
+      top_k: Type.Optional(
+        Type.Integer({ minimum: 1, maximum: 12, description: "Maximum number of results (default 6)." }),
+      ),
+    }),
+    replay: "safe",
+    execute: async (args) => {
+      const k = Math.max(1, Math.min(12, args.top_k ?? 6));
+      const runner = resolveVaultSemantic();
+      if (!runner) {
+        return {
+          content: [{ type: "text", text: JSON.stringify({ error: "vault-semantic not installed", results: [] }) }],
+        };
+      }
+      try {
+        const { stdout } = await execFileAsync(
+          runner.cmd,
+          [...runner.prefix, "search", args.query, "-k", String(k), "--json"],
+          { timeout: 15_000, maxBuffer: 2 * 1024 * 1024 },
+        );
+        return { content: [{ type: "text", text: stdout.trim() || "[]" }] };
+      } catch (err) {
+        return {
+          content: [
+            { type: "text", text: JSON.stringify({ error: String((err as Error)?.message ?? err), results: [] }) },
+          ],
+        };
+      }
+    },
+  });
   return defineExtension({
     name: "playground",
     tasks: jobs.tasks,
@@ -493,6 +551,7 @@ export function createPlayground(shared: SharedState, sessionId: string, spawn: 
       runJob,
       checkJob,
       searchHistoryTool,
+      vaultSearch,
       pingOnCall,
       subagent,
       startSession,
@@ -502,7 +561,7 @@ export function createPlayground(shared: SharedState, sessionId: string, spawn: 
       section(
         "playground",
         () =>
-          `You are a concise coding agent in the Durable Pi playground. Explain only what matters. Use only the tools you are offered; read only agents get no tools that write. Use read_state to inspect App State and update_state to create, update, delete, or increment any field. App State is shared across all agents, sessions, conversations and forks in this demo. It survives browser closure, interrupted agents, and backend restarts. Forks use the current shared object rather than a historical copy. Read before writing because other agents and humans can change it. Use only read_state and update_state for this object, never inspect or edit its database files. App State is a flexible JSON object: numbers, booleans, strings, arrays, nested objects, and null all render as live controls in the UI. Read before editing. Use list_durable_jobs and run_durable_job to run a repeatable durable job (a named workflow with checkpointed phases) when asked; pass only the inputs list_durable_jobs documents. Runs continue in the background: check them with check_durable_job, and wait only when asked. Use search_history to look back at earlier messages, tool calls or entries by number, including what came before a reset, handoff or compaction. Use ping_on_call_engineer only when asked to page someone; it works once. Use subagent only when explicitly asked to delegate. Use start_session only when asked to start a new session; it runs on its own. Never claim an action happened without using its tool. Background runs finish independently; do not wait in bash. A browser disconnect does not stop your work.`,
+          `You are a concise coding agent in the Durable Pi playground. Explain only what matters. Use only the tools you are offered; read only agents get no tools that write. Use read_state to inspect App State and update_state to create, update, delete, or increment any field. App State is shared across all agents, sessions, conversations and forks in this demo. It survives browser closure, interrupted agents, and backend restarts. Forks use the current shared object rather than a historical copy. Read before writing because other agents and humans can change it. Use only read_state and update_state for this object, never inspect or edit its database files. App State is a flexible JSON object: numbers, booleans, strings, arrays, nested objects, and null all render as live controls in the UI. Read before editing. Use list_durable_jobs and run_durable_job to run a repeatable durable job (a named workflow with checkpointed phases) when asked; pass only the inputs list_durable_jobs documents. Runs continue in the background: check them with check_durable_job, and wait only when asked. Use search_history to look back at earlier messages, tool calls or entries by number, including what came before a reset, handoff or compaction. Use vault_search to query the second-brain vault (Jev-reranked semantic search) before deciding about past work, architecture, or machine state. Use ping_on_call_engineer only when asked to page someone; it works once. Use subagent only when explicitly asked to delegate. Use start_session only when asked to start a new session; it runs on its own. Never claim an action happened without using its tool. Background runs finish independently; do not wait in bash. A browser disconnect does not stop your work.`,
         { tag: false },
       ),
     ],

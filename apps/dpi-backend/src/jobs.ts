@@ -411,6 +411,7 @@ const HANDLERS: Record<string, Record<string, Handler>> = {
   "adw-plan-build-verify": {
     scout: async (p) => {
       const dir = String(p.input.path);
+      const objective = String(p.input.objective);
       const branch = (
         await p.exec(
           inDir(dir, `git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "(not a git repo)"`),
@@ -428,16 +429,20 @@ const HANDLERS: Record<string, Record<string, Handler>> = {
       )
         .split("\n")
         .filter(Boolean);
+      const vaultOut = (
+        await p.shell(`~/.local/bin/vault-semantic search ${q(objective)} -k 4 2>/dev/null || true`)
+      ).out.trim();
       return {
         done: `${branch}, ${changed.length} changed files`,
-        data: { branch, recent, changed },
+        data: { branch, recent, changed, vaultContext: clip(vaultOut, 1200) },
       };
     },
     plan: async (p) => {
       const objective = String(p.input.objective);
       const dir = String(p.input.path);
+      const vaultHint = p.data.vaultContext ? `\nVault context:\n${String(p.data.vaultContext)}` : "";
       const planText = await p.agent(
-        `ADW plan: synthesize an execution plan for run #${p.run.n} in folder ${dir}. Objective: "${objective}". Use bash to inspect the top-level files or git log if needed, then reply in at most 5 short lines with: (1) target files, (2) concrete change steps, and (3) verification command. Do not edit files.`,
+        `ADW plan: synthesize an execution plan for run #${p.run.n} in folder ${dir}. Objective: "${objective}".${vaultHint}\nUse bash to inspect the top-level files or git log if needed, then reply in at most 5 short lines with: (1) target files, (2) concrete change steps, and (3) verification command. Do not edit files.`,
       );
       return {
         done: clip(planText.split("\n").find((l) => l.trim()) ?? "Plan synthesized", 120),

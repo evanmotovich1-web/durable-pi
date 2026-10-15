@@ -1,5 +1,6 @@
 import type {
   Api,
+  ApiStreamOptions,
   AssistantMessage,
   AssistantMessageEventStream,
   Model,
@@ -16,7 +17,6 @@ import {
   calculateCost,
   clampThinkingLevel,
   createProvider,
-  type ApiStreamOptions,
   type Provider,
 } from "@earendil-works/pi-ai/models";
 import {
@@ -254,7 +254,7 @@ export const stream = (
       const initialSystemMessage = getInitialSystemMessage(normalizedContext.messages);
       const systemText = initialSystemMessage
         ? getSystemMessageText(initialSystemMessage)
-        : (context.systemPrompt ?? "");
+        : ((context as { systemPrompt?: string }).systemPrompt ?? "");
 
       const generationConfig: Record<string, unknown> = {};
       if (options?.temperature !== undefined) {
@@ -291,7 +291,7 @@ export const stream = (
       }
 
       const currentTools = getCurrentTools(normalizedContext.messages);
-      const tools = currentTools.length > 0 ? currentTools : (context.tools ?? []);
+      const tools = currentTools.length > 0 ? currentTools : ((context as { tools?: unknown[] }).tools ?? []);
       if (tools.length > 0) {
         const supportsStrictMode = supportsGoogleStrictToolSampling(model.id);
         requestPayload.tools = convertTools(tools as any, false, supportsStrictMode);

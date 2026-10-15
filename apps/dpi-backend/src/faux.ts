@@ -69,7 +69,11 @@ export function installFaux(models: MutableModels) {
     }
     if (prompt.startsWith("search:")) return call("search_history", { query: prompt.slice(7).trim() });
     if (prompt.startsWith("page:")) return call("ping_on_call_engineer", { summary: prompt.slice(5).trim() });
-    if (prompt.startsWith("Release check:"))
+    if (
+      prompt.startsWith("Release check:") ||
+      prompt.startsWith("ADW plan:") ||
+      prompt.startsWith("Code audit:")
+    )
       return call("bash", { command: "git log --oneline -5 2>/dev/null || echo 'no git history'; ls | head -5" });
     if (prompt.startsWith("slow:")) return fauxAssistantMessage(fauxText(prompt.slice(5).trim().repeat(4)));
     return fauxAssistantMessage(fauxText(`Echo: ${prompt}`));

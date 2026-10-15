@@ -117,6 +117,95 @@ export const JOB_DEFS: JobDef[] = [
     resultPath: `/${RESULT_ROOT}/change-watch`,
     seconds: 25,
   },
+  {
+    id: "adw-plan-build-verify",
+    title: "ADW plan-build-verify",
+    summary:
+      "Run a 4-phase checkpointed ADW workflow: scout repository state, have a subagent synthesize a concrete plan for the objective, run verification checks, and hand off the verified packet to App State.",
+    phases: [
+      { id: "scout", label: "Scout", summary: "Inspect git branch, recent commits, changed files and workspace layout" },
+      { id: "plan", label: "Plan", summary: "Subagent analyzes the repository and synthesizes a concrete ADW plan" },
+      { id: "verify", label: "Verify", summary: "Execute bounded repository verification checks" },
+      { id: "handoff", label: "Handoff", summary: "Write the ADW packet to App State and verify persistence" },
+    ],
+    inputs: [
+      {
+        name: "objective",
+        type: "string",
+        default: "Audit repository health and next engineering step",
+        description: "Engineering objective for the ADW workflow",
+      },
+      {
+        name: "path",
+        type: "string",
+        default: ".",
+        description: "Target folder relative to the session working directory",
+      },
+    ],
+    approval: false,
+    resultPath: `/${RESULT_ROOT}/adw-plan-build-verify`,
+    seconds: 15,
+  },
+  {
+    id: "gemini-code-audit",
+    title: "Gemini code audit",
+    summary:
+      "Inventory source files and recent commit diffs, run a subagent code and risk audit, publish structured findings to App State, and verify the published audit report.",
+    phases: [
+      { id: "inventory", label: "Inventory", summary: "Collect recent commit log and diff stats" },
+      { id: "audit", label: "Audit", summary: "Subagent inspects recent changes and identifies top risks and fixes" },
+      { id: "publish", label: "Publish", summary: "Write the structured code audit report to App State" },
+      { id: "verify", label: "Verify", summary: "Read the audit report back from App State and confirm integrity" },
+    ],
+    inputs: [
+      {
+        name: "path",
+        type: "string",
+        default: ".",
+        description: "Folder to audit, relative to the session working directory",
+      },
+      {
+        name: "commits",
+        type: "integer",
+        default: 3,
+        min: 1,
+        max: 20,
+        description: "How many recent commits to include in the audit",
+      },
+    ],
+    approval: false,
+    resultPath: `/${RESULT_ROOT}/gemini-code-audit`,
+    seconds: 15,
+  },
+  {
+    id: "test-and-triage",
+    title: "Test and triage",
+    summary:
+      "Discover test files and runner scripts, execute a bounded verification command, triage the output and exit status, and persist the triage report to App State.",
+    phases: [
+      { id: "discover", label: "Discover", summary: "Detect test files and package manifests" },
+      { id: "execute", label: "Execute", summary: "Run the verification command and capture exit code and output" },
+      { id: "triage", label: "Triage", summary: "Summarize pass/fail health and save the triage report to App State" },
+      { id: "verify", label: "Verify", summary: "Confirm the triage report in App State matches this run" },
+    ],
+    inputs: [
+      {
+        name: "path",
+        type: "string",
+        default: ".",
+        description: "Folder to test, relative to the session working directory",
+      },
+      {
+        name: "command",
+        type: "string",
+        default: "git status --short",
+        description: "Verification command to execute in the target folder",
+      },
+    ],
+    approval: false,
+    resultPath: `/${RESULT_ROOT}/test-and-triage`,
+    seconds: 10,
+  },
 ];
 
 export const jobDef = (id: string) => JOB_DEFS.find((d) => d.id === id);
@@ -316,6 +405,197 @@ const HANDLERS: Record<string, Record<string, Handler>> = {
         changes,
       });
       return { done: changes.length ? `${changes.length} changes saved to App State` : "No changes. Report saved to App State" };
+    },
+  },
+
+  "adw-plan-build-verify": {
+    scout: async (p) => {
+      const dir = String(p.input.path);
+      const branch = (
+        await p.exec(
+          inDir(dir, `git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "(not a git repo)"`),
+          label(dir, "git rev-parse --abbrev-ref HEAD"),
+        )
+      ).trim();
+      const recent = (
+        await p.exec(
+          inDir(dir, `git log --oneline -5 2>/dev/null || echo "(no commits)"`),
+          label(dir, "git log --oneline -5"),
+        )
+      ).trim();
+      const changed = (
+        await p.exec(inDir(dir, "git status --short 2>/dev/null | head -40"), label(dir, "git status --short"))
+      )
+        .split("\n")
+        .filter(Boolean);
+      return {
+        done: `${branch}, ${changed.length} changed files`,
+        data: { branch, recent, changed },
+      };
+    },
+    plan: async (p) => {
+      const objective = String(p.input.objective);
+      const dir = String(p.input.path);
+      const planText = await p.agent(
+        `ADW plan: synthesize an execution plan for run #${p.run.n} in folder ${dir}. Objective: "${objective}". Use bash to inspect the top-level files or git log if needed, then reply in at most 5 short lines with: (1) target files, (2) concrete change steps, and (3) verification command. Do not edit files.`,
+      );
+      return {
+        done: clip(planText.split("\n").find((l) => l.trim()) ?? "Plan synthesized", 120),
+        data: { plan: planText },
+      };
+    },
+    verify: async (p) => {
+      const dir = String(p.input.path);
+      const statusOut = await p.exec(
+        inDir(dir, `git status --short 2>/dev/null | head -30 || ls -1 | head -20`),
+        label(dir, "verify workspace state"),
+      );
+      const fileCount = Number(
+        (
+          await p.exec(
+            inDir(dir, `${FIND} | wc -l`),
+            label(dir, "count workspace files"),
+          )
+        ).trim(),
+      );
+      return {
+        done: `Verified (${fileCount} files in workspace)`,
+        data: { verifiedFiles: fileCount, verifyOutput: tail(statusOut, 6) },
+      };
+    },
+    handoff: async (p) => {
+      await p.saveState(`/${RESULT_ROOT}/adw-plan-build-verify`, {
+        run: p.run.n,
+        at: new Date(p.now()).toISOString(),
+        objective: String(p.input.objective),
+        folder: String(p.input.path),
+        branch: p.data.branch ?? null,
+        changed: p.data.changed ?? [],
+        plan: p.data.plan ?? "",
+        verifiedFiles: p.data.verifiedFiles ?? 0,
+      });
+      const saved = (await p.readState(`/${RESULT_ROOT}/adw-plan-build-verify`)) as { run?: number } | undefined;
+      await p.step("state", `read_state /${RESULT_ROOT}/adw-plan-build-verify`, async () => {
+        if (saved?.run !== p.run.n)
+          throw Error(`App State holds run #${saved?.run ?? "none"}, not run #${p.run.n}.`);
+        return { value: undefined, detail: `run #${saved.run} verified in App State` };
+      });
+      return { done: `ADW packet for run #${p.run.n} saved to App State` };
+    },
+  },
+
+  "gemini-code-audit": {
+    inventory: async (p) => {
+      const dir = String(p.input.path);
+      const commits = Number(p.input.commits);
+      const logOut = (
+        await p.exec(
+          inDir(dir, `git log --oneline -${commits} 2>/dev/null || echo "(no git log)"`),
+          label(dir, `git log --oneline -${commits}`),
+        )
+      ).trim();
+      const diffStat = (
+        await p.exec(
+          inDir(dir, `git status --short 2>/dev/null | head -40`),
+          label(dir, "git status --short"),
+        )
+      ).trim();
+      return {
+        done: `Inventoried ${commits} commits`,
+        data: { logOut, diffStat },
+      };
+    },
+    audit: async (p) => {
+      const dir = String(p.input.path);
+      const commits = Number(p.input.commits);
+      const findings = await p.agent(
+        `Code audit: review the last ${commits} commits in ${dir} for run #${p.run.n}. Use bash to inspect git log or recent changes, then reply in at most 5 short lines with top risks, edge cases, or verification checks. Do not edit files.`,
+      );
+      return {
+        done: clip(findings.split("\n").find((l) => l.trim()) ?? "Audit complete", 120),
+        data: { findings },
+      };
+    },
+    publish: async (p) => {
+      await p.saveState(`/${RESULT_ROOT}/gemini-code-audit`, {
+        run: p.run.n,
+        at: new Date(p.now()).toISOString(),
+        folder: String(p.input.path),
+        commits: Number(p.input.commits),
+        log: p.data.logOut ?? "",
+        diffStat: p.data.diffStat ?? "",
+        findings: p.data.findings ?? "",
+      });
+      return { done: `Published audit to App State /${RESULT_ROOT}/gemini-code-audit` };
+    },
+    verify: async (p) => {
+      const saved = (await p.readState(`/${RESULT_ROOT}/gemini-code-audit`)) as { run?: number; findings?: string } | undefined;
+      await p.step("state", `read_state /${RESULT_ROOT}/gemini-code-audit`, async () => {
+        if (saved?.run !== p.run.n)
+          throw Error(`App State holds run #${saved?.run ?? "none"}, not run #${p.run.n}.`);
+        return { value: undefined, detail: `run #${saved.run}, ${saved.findings?.length ?? 0} chars of findings` };
+      });
+      return { done: `Code audit for run #${p.run.n} verified` };
+    },
+  },
+
+  "test-and-triage": {
+    discover: async (p) => {
+      const dir = String(p.input.path);
+      const testFilesRaw = await p.exec(
+        inDir(
+          dir,
+          `find . -maxdepth 3 -type f \\( -name '*.test.*' -o -name 'test_*' -o -name '*_test.*' \\) -not -path '*/.git/*' -not -path '*/node_modules/*' | head -50`,
+        ),
+        label(dir, "discover test files"),
+      );
+      const testFiles = testFilesRaw.split("\n").map((s) => s.trim()).filter(Boolean);
+      return {
+        done: `${testFiles.length} test files discovered`,
+        data: { testFiles },
+      };
+    },
+    execute: async (p) => {
+      const dir = String(p.input.path);
+      const cmd = String(p.input.command);
+      const res = await p.step("command", label(dir, cmd), async () => {
+        const r = await p.shell(inDir(dir, cmd));
+        return {
+          value: { exitCode: r.code, output: tail(r.out, 12) },
+          detail: `exit ${r.code}${r.out.trim() ? `: ${clip(tail(r.out, 3), 200)}` : ""}`,
+        };
+      });
+      return {
+        done: `Command exited with ${res.exitCode}`,
+        data: { exitCode: res.exitCode, output: res.output },
+      };
+    },
+    triage: async (p) => {
+      const exitCode = Number(p.data.exitCode ?? 0);
+      const status = exitCode === 0 ? "healthy" : "needs-attention";
+      await p.saveState(`/${RESULT_ROOT}/test-and-triage`, {
+        run: p.run.n,
+        at: new Date(p.now()).toISOString(),
+        folder: String(p.input.path),
+        command: String(p.input.command),
+        testFiles: p.data.testFiles ?? [],
+        exitCode,
+        status,
+        output: p.data.output ?? "",
+      });
+      return {
+        done: `Triage status: ${status} (exit ${exitCode})`,
+        data: { status },
+      };
+    },
+    verify: async (p) => {
+      const saved = (await p.readState(`/${RESULT_ROOT}/test-and-triage`)) as { run?: number; status?: string } | undefined;
+      await p.step("state", `read_state /${RESULT_ROOT}/test-and-triage`, async () => {
+        if (saved?.run !== p.run.n)
+          throw Error(`App State holds run #${saved?.run ?? "none"}, not run #${p.run.n}.`);
+        return { value: undefined, detail: `run #${saved.run}, status=${saved.status ?? "unknown"}` };
+      });
+      return { done: `Triage report for run #${p.run.n} verified` };
     },
   },
 };

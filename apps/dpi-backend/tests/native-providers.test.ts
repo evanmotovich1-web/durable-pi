@@ -70,3 +70,49 @@ test("an existing faux session opens after the backend switches to native provid
     await t.cleanup();
   }
 });
+
+test("native device with google-gemini-cli OAuth credentials enables gemini-4-argon as default preferred model", async () => {
+  const t = await tempStore();
+  const authPath = join(t.root, "auth.json");
+  await writeFile(authPath, JSON.stringify({
+    "google-gemini-cli": oauth(),
+    "openai-codex": oauth(),
+  }), { mode: 0o600 });
+  const token = newToken();
+  const server = await bootServer({ home: join(t.root, "server"), startDirs: t.work, token, provider: "native", authPath });
+  try {
+    const res = await fetch(`${server.base}/v1/device`, { headers: { authorization: `Bearer ${token}` } });
+    assert.equal(res.status, 200);
+    const device = await res.json();
+    assert.deepEqual(device.models.map((m: { provider: string; id: string }) => [m.provider, m.id]), [
+      ["google-gemini-cli", "gemini-4-argon"],
+      ["google-gemini-cli", "gemini-3.8-flash"],
+      ["openai-codex", "gpt-6-sol"],
+    ]);
+    assert.equal(device.defaultModel, "gemini-4-argon");
+  } finally {
+    await server.stop();
+    const store = await Store.open({ ...t.options, provider: "native", credentials: new PiAuthStore(authPath) });
+    try {
+      assert.deepEqual(store.routedModel(), { provider: "google-gemini-cli", modelId: "gemini-4-argon" });
+      assert.deepEqual(store.routedModel({ provider: "openrouter", modelId: "x-ai/grok-4.7" }), {
+        provider: "google-gemini-cli",
+        modelId: "gemini-4-argon",
+      });
+    } finally {
+      await store.close();
+      await t.cleanup();
+    }
+  }
+});
+
+test("resolveBackendModelId maps gemini-4-argon and gemini-3.8-flash to effort-suffixed backend IDs", async () => {
+  const { resolveBackendModelId } = await import("../src/google-gemini-cli-provider.js");
+  assert.equal(resolveBackendModelId("gemini-4-argon"), "gemini-4-argon-high");
+  assert.equal(resolveBackendModelId("gemini-4-argon", { enabled: false }), "gemini-4-argon-low");
+  assert.equal(resolveBackendModelId("gemini-4-argon", { enabled: true, level: "LOW" }), "gemini-4-argon-low");
+  assert.equal(resolveBackendModelId("gemini-4-argon", { enabled: true, level: "MEDIUM" }), "gemini-4-argon-medium");
+  assert.equal(resolveBackendModelId("gemini-3.8-flash"), "gemini-3.8-flash-high");
+  assert.equal(resolveBackendModelId("gemini-3.8-flash", { enabled: true, level: "LOW" }), "gemini-3.8-flash-low");
+  assert.equal(resolveBackendModelId("gemini-3.8-flash", { enabled: true, level: "MEDIUM" }), "gemini-3.8-flash-medium");
+});

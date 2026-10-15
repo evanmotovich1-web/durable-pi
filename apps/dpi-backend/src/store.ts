@@ -43,6 +43,7 @@ import { openaiCodexProvider } from "@earendil-works/pi-ai/providers/openai-code
 import { xaiProvider } from "@earendil-works/pi-ai/providers/xai";
 import { zaiCodingCnProvider } from "@earendil-works/pi-ai/providers/zai-coding-cn";
 import { deepseekProvider } from "@earendil-works/pi-ai/providers/deepseek";
+import { googleGeminiCliProvider } from "./google-gemini-cli-provider.js";
 import { curatedModels, preferredModel } from "./model-catalog.js";
 import { PiAuthStore } from "./pi-auth-store.js";
 import { fauxModels, installFaux } from "./faux.js";
@@ -228,7 +229,7 @@ export class Store {
     // Old faux sessions must still open when a device switches to native providers.
     installFaux(this.models);
     if (options.provider === "native")
-      for (const provider of [openaiCodexProvider(), xaiProvider(), zaiCodingCnProvider(), deepseekProvider()])
+      for (const provider of [openaiCodexProvider(), xaiProvider(), zaiCodingCnProvider(), deepseekProvider(), googleGeminiCliProvider()])
         this.models.setProvider(provider);
     mkdirSync(options.dataDir, { recursive: true, mode: 0o700 });
     this.unlockCatalog = lockFile(`${this.catalogPath}.lock`);
@@ -348,7 +349,7 @@ export class Store {
     const credentials = this.credentials!;
     const stored = new Map((await credentials.list()).map((c) => [c.providerId, c.type]));
     const enabled = new Set<string>();
-    for (const provider of ["openai-codex", "xai"])
+    for (const provider of ["openai-codex", "xai", "google-gemini-cli"])
       if (stored.get(provider) === "oauth") enabled.add(provider);
     for (const [provider, envName] of [["zai-coding-cn", "ZAI_CODING_CN_API_KEY"], ["deepseek", "DEEPSEEK_API_KEY"]]) {
       const credential = stored.get(provider) === "api_key" ? await credentials.read(provider) : undefined;

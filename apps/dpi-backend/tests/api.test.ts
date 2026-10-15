@@ -106,10 +106,22 @@ test("REST v1: auth, sessions, agents, messages, waits, idempotency, errors", as
 
     // Demo extension + docs.
     // Durable jobs: definitions on the device, a run started by a client, then one started by the agent's tool.
-    assert.deepEqual((await client.device()).jobs?.map((j) => j.id), ["workspace-snapshot", "release-check", "change-watch"]);
+    assert.deepEqual((await client.device()).jobs?.map((j) => j.id), [
+      "workspace-snapshot",
+      "release-check",
+      "change-watch",
+      "adw-plan-build-verify",
+      "gemini-code-audit",
+      "test-and-triage",
+    ]);
     const runs = async () => (await main.doc<JobRunsDoc>("demo.job-runs")).value.items;
     const job = await main.demo<{ taskId: number }>("jobs", { job: "workspace-snapshot" });
     await until(async () => (await runs())[job.taskId]?.status === "completed", 15000, "job");
+    const adwJob = await main.demo<{ taskId: number }>("jobs", {
+      job: "adw-plan-build-verify",
+      input: { objective: "Verify ADW durable workflow", path: "." },
+    });
+    await until(async () => (await runs())[adwJob.taskId]?.status === "completed", 25000, "adw-plan-build-verify job");
     await assert.rejects(() => main.demo("jobs", { job: "workspace-snapshot", input: { depth: 2 } }), (e: DpiError) => e.code === "invalid" && /no input depth/.test(e.message));
     assert.ok((await main.entries({ scope: "all" })).items.some((e) => e.kind === "demo.job" && (e.data as { taskId: number }).taskId === job.taskId));
     // The newest result of a tool, as text (entries come newest first).

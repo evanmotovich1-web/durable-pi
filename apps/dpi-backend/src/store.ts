@@ -43,9 +43,9 @@ import { openaiCodexProvider } from "@earendil-works/pi-ai/providers/openai-code
 import { xaiProvider } from "@earendil-works/pi-ai/providers/xai";
 import { zaiCodingCnProvider } from "@earendil-works/pi-ai/providers/zai-coding-cn";
 import { deepseekProvider } from "@earendil-works/pi-ai/providers/deepseek";
-import { googleGeminiCliProvider } from "./google-gemini-cli-provider.js";
+import { googleGeminiCliProvider, hasGeminiLoginBridge } from "./google-gemini-cli-provider.js";
 import { curatedModels, preferredModel } from "./model-catalog.js";
-import { PiAuthStore } from "./pi-auth-store.js";
+import { PiAuthStore, piAuthPath } from "./pi-auth-store.js";
 import { fauxModels, installFaux } from "./faux.js";
 import {
   Harness,
@@ -351,6 +351,15 @@ export class Store {
     const enabled = new Set<string>();
     for (const provider of ["openai-codex", "xai", "google-gemini-cli"])
       if (stored.get(provider) === "oauth") enabled.add(provider);
+    if (
+      !enabled.has("google-gemini-cli") &&
+      !process.env.DPI_PI_AUTH_FILE &&
+      credentials instanceof PiAuthStore &&
+      credentials.path === resolve(join(homedir(), ".pi", "agent", "auth.json")) &&
+      hasGeminiLoginBridge()
+    ) {
+      enabled.add("google-gemini-cli");
+    }
     for (const [provider, envName] of [["zai-coding-cn", "ZAI_CODING_CN_API_KEY"], ["deepseek", "DEEPSEEK_API_KEY"]]) {
       const credential = stored.get(provider) === "api_key" ? await credentials.read(provider) : undefined;
       if ((credential?.type === "api_key" && credential.key) || process.env[envName]) enabled.add(provider);

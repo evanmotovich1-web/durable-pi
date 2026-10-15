@@ -1,3 +1,7 @@
+import { spawn } from "node:child_process";
+import { existsSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import type {
   Api,
   ApiStreamOptions,
@@ -34,6 +38,7 @@ import { sanitizeSurrogates } from "@earendil-works/pi-ai/utils/sanitize-unicode
 import { getSystemMessageText } from "@earendil-works/pi-ai/utils/text";
 import {
   collapseSystemMessages,
+  getCurrentSystemPrompt,
   getCurrentTools,
   getInitialSystemMessage,
 } from "@earendil-works/pi-ai/utils/transcript";
@@ -44,6 +49,18 @@ const DEFAULT_ENDPOINT = "https://daily-cloudcode-pa.googleapis.com";
 const ANTIGRAVITY_USER_AGENT =
   "antigravity/cli/1.3.5 (aidev_client; os_type=darwin; arch=arm64; cl=998863838; auth_method=consumer)";
 const DEFAULT_CONSUMER_PROJECT_ID = "aicode-consumers";
+export const BRIDGE_MANAGED_TOKEN = "managed-by-official-cli";
+
+export function geminiLoginBridgeScript(): string {
+  return (
+    process.env.GEMINI_LOGIN_BRIDGE ||
+    join(homedir(), ".local/share/gemini-login-bridge/gemini_login_bridge.py")
+  );
+}
+
+export function hasGeminiLoginBridge(): boolean {
+  return existsSync(geminiLoginBridgeScript());
+}
 
 const rev = (s: string) => s.split("").reverse().join("");
 const oauthHost = ["apps", "googleusercontent", "com"].join(".");
@@ -213,13 +230,357 @@ export function resolveBackendModelId(
   return modelId;
 }
 
+function resolveBridgeModelId(modelId: string): "gemini-4-argon" | "gemini-3.8-flash" | undefined {
+  if (modelId.startsWith("gemini-4-argon")) return "gemini-4-argon";
+  if (modelId.startsWith("gemini-3.8-flash")) return "gemini-3.8-flash";
+  return undefined;
+}
+
+function resolveBridgeEffort(
+  modelId: string,
+  thinkingOpt?: { enabled?: boolean; level?: string },
+): "low" | "medium" | "high" {
+  if (modelId.endsWith("-low")) return "low";
+  if (modelId.endsWith("-medium")) return "medium";
+  if (modelId.endsWith("-high")) return "high";
+  if (thinkingOpt?.enabled === false) return "low";
+  const level = String(thinkingOpt?.level ?? "high").toLowerCase();
+  if (level === "medium") return "medium";
+  if (level === "off" || level === "minimal" || level === "low") return "low";
+  return "high";
+}
+
+function extractBridgeText(content: unknown): string {
+  if (typeof content === "string") return content;
+  const out: string[] = [];
+  for (const part of (Array.isArray(content) ? content : []) as Array<Record<string, unknown>>) {
+    if (part.type === "text") out.push(String(part.text ?? ""));
+    else if (part.type === "image" || part.type === "image_url") {
+      throw new Error("Gemini login bridge does not support image input in text-only CLI mode.");
+    }
+  }
+  return out.join("\n");
+}
+
+function toBridgeMessages(transcript: readonly any[], systemPrompt: string) {
+  const out: Array<Record<string, unknown>> = systemPrompt
+    ? [{ role: "system", content: systemPrompt }]
+    : [];
+  for (const message of transcript) {
+    if (message.role === "system") continue;
+    if (message.role === "toolResult") {
+      out.push({
+        role: "tool",
+        tool_call_id: message.toolCallId,
+        name: message.toolName,
+        content: extractBridgeText(message.content),
+      });
+    } else if (message.role === "assistant") {
+      const calls = ((message.content ?? []) as any[])
+        .filter((p) => p.type === "toolCall")
+        .map((p) => ({
+          id: p.id,
+          type: "function",
+          function: { name: p.name, arguments: JSON.stringify(p.arguments ?? {}) },
+        }));
+      const item: Record<string, unknown> = {
+        role: "assistant",
+        content: extractBridgeText(message.content),
+      };
+      if (calls.length > 0) item.tool_calls = calls;
+      out.push(item);
+    } else if (message.role === "user") {
+      out.push({ role: "user", content: extractBridgeText(message.content) });
+    } else {
+      throw new Error(`Unsupported transcript role: ${String(message.role)}`);
+    }
+  }
+  return out;
+}
+
+function toBridgeTools(tools: readonly any[]) {
+  return tools.map((t) => ({
+    type: "function",
+    function: {
+      name: t.name,
+      description: t.description ?? "",
+      parameters: t.parameters ?? { type: "object", properties: {} },
+    },
+  }));
+}
+
+function invokeGeminiLoginBridge(
+  request: Record<string, unknown>,
+  signal?: AbortSignal,
+): Promise<any> {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(new Error("Request aborted"));
+      return;
+    }
+    const script = geminiLoginBridgeScript();
+    const proc = spawn("python3", [script], {
+      detached: process.platform !== "win32",
+      stdio: ["pipe", "pipe", "pipe"],
+      env: { ...process.env, GEMINI_LOGIN_PARENT_PROCESS_GROUP: "1" },
+    });
+    let out = "";
+    let errOut = "";
+    let closed = false;
+    let settled = false;
+    let cancelReason: string | undefined;
+    let killTimer: ReturnType<typeof setTimeout> | undefined;
+    let settleTimer: ReturnType<typeof setTimeout> | undefined;
+
+    const sendSig = (sig: NodeJS.Signals) => {
+      if (!proc.pid) return;
+      try {
+        if (process.platform === "win32") proc.kill(sig);
+        else process.kill(-proc.pid, sig);
+      } catch {
+        try {
+          proc.kill(sig);
+        } catch {}
+      }
+    };
+
+    const timeoutSeconds =
+      typeof request.timeout_seconds === "number" ? request.timeout_seconds : 180;
+    const hardTimer = setTimeout(
+      () => stop("Gemini login bridge timed out"),
+      (timeoutSeconds + 15) * 1000,
+    );
+
+    const cleanup = () => {
+      clearTimeout(hardTimer);
+      if (!cancelReason && killTimer) clearTimeout(killTimer);
+      if (settleTimer) clearTimeout(settleTimer);
+      signal?.removeEventListener("abort", onAbort);
+    };
+
+    const finish = (error?: Error, result?: any) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      if (error) reject(error);
+      else resolve(result);
+    };
+
+    const stop = (reason: string) => {
+      if (closed || cancelReason) return;
+      cancelReason = reason;
+      sendSig("SIGTERM");
+      killTimer = setTimeout(() => {
+        sendSig("SIGKILL");
+        if (closed) return;
+        settleTimer = setTimeout(() => {
+          proc.stdin.destroy();
+          proc.stdout.destroy();
+          proc.stderr.destroy();
+          proc.unref();
+          finish(new Error(cancelReason));
+        }, 250);
+      }, 5000);
+    };
+
+    const onAbort = () => stop("Request aborted");
+    signal?.addEventListener("abort", onAbort, { once: true });
+
+    proc.stdout.setEncoding("utf8");
+    proc.stdout.on("data", (chunk: string) => {
+      if (cancelReason) return;
+      out += chunk;
+    });
+    proc.stderr.setEncoding("utf8");
+    proc.stderr.on("data", (chunk: string) => {
+      if (cancelReason || errOut.length > 4096) return;
+      errOut += chunk;
+    });
+    proc.on("error", () => finish(new Error(cancelReason ?? "Cannot start Gemini login bridge.")));
+    proc.on("close", (code) => {
+      closed = true;
+      if (cancelReason || signal?.aborted) {
+        finish(new Error(cancelReason ?? "Request aborted"));
+        return;
+      }
+      if (code !== 0) {
+        let diag = "";
+        try {
+          const parsedErr = JSON.parse(errOut);
+          diag = parsedErr?.error?.message || "";
+        } catch {}
+        finish(
+          new Error(
+            diag ? `Gemini login bridge: ${diag}` : `Gemini login bridge exit ${String(code)}.`,
+          ),
+        );
+        return;
+      }
+      try {
+        const data = JSON.parse(out);
+        finish(undefined, data);
+      } catch {
+        finish(new Error(`Gemini login bridge returned invalid JSON (exit ${String(code)}).`));
+      }
+    });
+    proc.stdin.on("error", () => {});
+    proc.stdin.end(JSON.stringify(request));
+  });
+}
+
+function streamViaGeminiLoginBridge(
+  model: Model<Api>,
+  bridgeModelId: "gemini-4-argon" | "gemini-3.8-flash",
+  normalizedContext: TranscriptContext,
+  rawContext: TranscriptContext,
+  options?: ApiStreamOptions<Api>,
+): AssistantMessageEventStream {
+  const eventStream = createAssistantMessageEventStream();
+  (async () => {
+    const output: AssistantMessage = {
+      role: "assistant",
+      content: [],
+      api: model.api,
+      provider: model.provider,
+      model: model.id,
+      usage: {
+        input: 0,
+        output: 0,
+        cacheRead: 0,
+        cacheWrite: 0,
+        totalTokens: 0,
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+      },
+      stopReason: "stop",
+      timestamp: Date.now(),
+    };
+
+    try {
+      const systemText =
+        getCurrentSystemPrompt(normalizedContext.messages) ||
+        ((rawContext as { systemPrompt?: string }).systemPrompt ?? "");
+      const currentTools = getCurrentTools(normalizedContext.messages);
+      const tools =
+        currentTools.length > 0
+          ? currentTools
+          : ((rawContext as { tools?: unknown[] }).tools ?? []);
+      const thinkingOpt = (options as any)?.thinking;
+
+      let request: Record<string, unknown> = {
+        model: bridgeModelId,
+        messages: toBridgeMessages(normalizedContext.messages, systemText),
+        tools: toBridgeTools(tools as any[]),
+        reasoning_effort: resolveBridgeEffort(model.id, thinkingOpt),
+        timeout_seconds: 180,
+      };
+
+      const nextBody = await options?.onPayload?.(request, model);
+      if (options?.signal?.aborted) throw new Error("Request aborted");
+      if (nextBody !== undefined) request = nextBody as Record<string, unknown>;
+
+      const result = await invokeGeminiLoginBridge(request, options?.signal);
+      if (options?.signal?.aborted) throw new Error("Request aborted");
+
+      await options?.onResponse?.({ status: 200, headers: {} }, model);
+      await options?.onProviderStreamEvent?.(result, model);
+
+      eventStream.push({ type: "start", partial: output });
+
+      if (typeof result.content === "string" && result.content.length > 0) {
+        const index = output.content.length;
+        const textBlock: TextContent = { type: "text", text: "" };
+        output.content.push(textBlock);
+        eventStream.push({ type: "text_start", contentIndex: index, partial: output });
+        textBlock.text = result.content;
+        eventStream.push({
+          type: "text_delta",
+          contentIndex: index,
+          delta: result.content,
+          partial: output,
+        });
+        eventStream.push({
+          type: "text_end",
+          contentIndex: index,
+          content: result.content,
+          partial: output,
+        });
+      }
+
+      for (const call of (result.tool_calls ?? []) as any[]) {
+        const index = output.content.length;
+        const rawArgs = call?.function?.arguments;
+        const parsedArgs =
+          typeof rawArgs === "string" ? JSON.parse(rawArgs) : (rawArgs ?? {});
+        const toolCall: ToolCall = {
+          type: "toolCall",
+          id: call.id || `${call?.function?.name || "tool"}_${Date.now()}_${++toolCallCounter}`,
+          name: call?.function?.name || "",
+          arguments: parsedArgs,
+        };
+        output.content.push(toolCall);
+        eventStream.push({ type: "toolcall_start", contentIndex: index, partial: output });
+        eventStream.push({
+          type: "toolcall_delta",
+          contentIndex: index,
+          delta: JSON.stringify(toolCall.arguments),
+          partial: output,
+        });
+        eventStream.push({
+          type: "toolcall_end",
+          contentIndex: index,
+          toolCall,
+          partial: output,
+        });
+      }
+
+      const usage = result.usage ?? {};
+      const cached = usage.prompt_tokens_details?.cached_tokens ?? 0;
+      const promptTokens = usage.prompt_tokens ?? 0;
+      const completionTokens = usage.completion_tokens ?? 0;
+      output.usage = {
+        input: Math.max(0, promptTokens - cached),
+        output: completionTokens,
+        cacheRead: cached,
+        cacheWrite: 0,
+        totalTokens: usage.total_tokens ?? promptTokens + completionTokens,
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+      };
+      calculateCost(model, output.usage);
+      output.responseId = result.conversation_id;
+      output.stopReason =
+        Array.isArray(result.tool_calls) && result.tool_calls.length > 0 ? "toolUse" : "stop";
+
+      eventStream.push({
+        type: "done",
+        reason: output.stopReason as any,
+        message: output,
+      });
+      eventStream.end();
+    } catch (error) {
+      output.stopReason = options?.signal?.aborted ? "aborted" : "error";
+      output.errorMessage = error instanceof Error ? error.message : String(error);
+      eventStream.push({
+        type: "error",
+        reason: output.stopReason as any,
+        error: output,
+      });
+      eventStream.end();
+    }
+  })();
+  return eventStream;
+}
+
 export const stream = (
   model: Model<Api>,
   context: TranscriptContext,
   options?: ApiStreamOptions<Api>,
 ): AssistantMessageEventStream => {
-  const eventStream = createAssistantMessageEventStream();
   const normalizedContext = collapseSystemMessages(context);
+  const bridgeModelId = resolveBridgeModelId(model.id);
+  if (bridgeModelId && hasGeminiLoginBridge() && !(options as { fetch?: typeof fetch })?.fetch) {
+    return streamViaGeminiLoginBridge(model, bridgeModelId, normalizedContext, context, options);
+  }
+  const eventStream = createAssistantMessageEventStream();
 
   (async () => {
     const output: AssistantMessage = {
@@ -685,6 +1046,18 @@ export function googleGeminiCliProvider(): Provider {
               ...(projectId ? { "x-goog-user-project": projectId } : {}),
             },
           };
+        },
+      },
+      apiKey: {
+        name: GEMINI_CLI_PROVIDER_NAME,
+        resolve: async () => {
+          if (hasGeminiLoginBridge()) {
+            return {
+              auth: { apiKey: BRIDGE_MANAGED_TOKEN },
+              source: "Gemini Login Bridge",
+            };
+          }
+          return undefined;
         },
       },
     },
